@@ -375,48 +375,98 @@ class TripAgentApp(tk.Tk):
         card.pack(fill="x", padx=4, pady=4)
         card.columnconfigure(1, weight=1)
 
-        # カード左：番号バッジ
-        badge = tk.Label(
+        # ---- カード左：番号バッジ ----
+        badge_rows = 6  # セグメントがある場合でも十分な行数
+        tk.Label(
             card, text=f" {index} ",
             font=(FONT_BASE[0], 13, "bold"),
             bg=BTN_TRAIN_BOOK, fg=BTN_FG,
             width=3,
-        )
-        badge.grid(row=0, column=0, rowspan=4, sticky="ns", padx=(0, 8))
+        ).grid(row=0, column=0, rowspan=badge_rows, sticky="ns", padx=(0, 8))
 
-        # 路線サマリー
+        row = 0
+
+        # ---- 路線サマリー（例: のぞみ123号 / JR神戸線→のぞみ316号）----
         tk.Label(
             card, text=route.get("route_summary", "—"),
             font=FONT_BOLD, fg=LABEL_FG, bg=CARD_BG, anchor="w",
-        ).grid(row=0, column=1, columnspan=3, sticky="w", padx=4, pady=(6, 2))
+            wraplength=400,
+        ).grid(row=row, column=1, columnspan=3, sticky="w", padx=4, pady=(6, 2))
+        row += 1
 
-        # 時刻・所要時間・料金
+        # ---- トータル: 出発・到着・所要時間・料金 ----
         info_frame = tk.Frame(card, bg=CARD_BG)
-        info_frame.grid(row=1, column=1, columnspan=3, sticky="w", padx=4, pady=2)
+        info_frame.grid(row=row, column=1, columnspan=3, sticky="w", padx=4, pady=(0, 4))
+        row += 1
 
-        details = [
+        for col, (lbl, val) in enumerate([
             ("🕐 出発", route.get("dep_time", "—")),
             ("🏁 到着", route.get("arr_time", "—")),
             ("⏱ 所要", route.get("duration", "—")),
             ("💴 料金", route.get("fare", "—")),
-        ]
-        for col, (lbl, val) in enumerate(details):
+        ]):
             tk.Label(info_frame, text=lbl, font=FONT_SMALL, fg=MUTED_FG, bg=CARD_BG).grid(
-                row=0, column=col * 2, padx=(8, 2)
+                row=0, column=col * 2, padx=(8 if col > 0 else 0, 2)
             )
             tk.Label(info_frame, text=val, font=FONT_BOLD, fg=LABEL_FG, bg=CARD_BG).grid(
                 row=0, column=col * 2 + 1, padx=(0, 12)
             )
 
-        # 予約ボタン
+        # ---- 経路詳細セクション ----
+        segments = route.get("segments", [])
+        if segments:
+            # 区切り線
+            sep = tk.Frame(card, bg=CARD_BORDER, height=1)
+            sep.grid(row=row, column=1, columnspan=3, sticky="ew", padx=8, pady=(2, 4))
+            row += 1
+
+            detail_frame = tk.Frame(card, bg=CARD_BG)
+            detail_frame.grid(row=row, column=1, columnspan=3, sticky="w", padx=8, pady=(0, 4))
+            row += 1
+
+            for seg in segments:
+                if seg["type"] == "station":
+                    # 駅行: 「🚉 07:00  東京」
+                    t    = seg.get("time", "")
+                    name = seg.get("name", "")
+                    time_str = f"{t}  " if t else ""
+                    # 乗り換え駅（先頭・末尾以外）は色を変える
+                    is_endpoint = (
+                        seg is segments[0]
+                        or seg is next((s for s in reversed(segments) if s["type"] == "station"), None)
+                    )
+                    fg_color = LABEL_FG if is_endpoint else "#E67E22"
+                    prefix   = "🚉" if is_endpoint else "🔄"
+                    tk.Label(
+                        detail_frame,
+                        text=f"{prefix} {time_str}{name}",
+                        font=FONT_BASE,
+                        fg=fg_color, bg=CARD_BG,
+                        anchor="w",
+                    ).pack(anchor="w", pady=1)
+
+                elif seg["type"] == "train":
+                    # 列車行: 「  ↓  のぞみ123号」
+                    tk.Label(
+                        detail_frame,
+                        text=f"    ↓  {seg['name']}",
+                        font=FONT_SMALL,
+                        fg=MUTED_FG, bg=CARD_BG,
+                        anchor="w",
+                    ).pack(anchor="w", pady=0)
+        else:
+            # セグメント取得できなかった場合は1行空ける
+            row += 1
+
+        # ---- 予約ボタン ----
         booking_name = route.get("booking_name", "予約サイトを開く")
-        booking_url = route.get("booking_url", "")
+        booking_url  = route.get("booking_url", "")
         make_button(
             card,
             f"🎫 {booking_name} で予約する",
             lambda url=booking_url: webbrowser.open(url),
             bg=BTN_TRAIN_BOOK, padx=10, pady=5,
-        ).grid(row=2, column=1, columnspan=3, sticky="w", padx=4, pady=(4, 8))
+        ).grid(row=row, column=1, columnspan=3, sticky="w", padx=4, pady=(4, 8))
 
     def _render_hotel_results(self):
         for w in self._hotel_frame.winfo_children():
