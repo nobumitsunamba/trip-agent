@@ -5,18 +5,22 @@ search_hotel.py
 API仕様:
     VacantHotelSearch/20170426
         https://webservice.rakuten.co.jp/documentation/vacant-hotel-search
-        必須: applicationId, checkinDate, checkoutDate + (latitude+longitude)
+        必須: applicationId, checkinDate, checkoutDate + 位置情報
+        位置情報: latitude + longitude + datumType  ← datumType は必須
         sort: +roomCharge, -roomCharge, +hotelReviewAverage, -hotelReviewAverage
-        ※ roomCharge は実際の空室料金。日付あり検索専用。
 
     SimpleHotelSearch/20170426
         https://webservice.rakuten.co.jp/documentation/simple-hotel-search
-        必須: applicationId + (latitude+longitude)
-        sort: +hotelMinCharge, -hotelMinCharge, +hotelReviewAverage, -hotelReviewAverage,
-              +hotelNo, -hotelNo, +hotelName, -hotelName, standard
-        ※ roomCharge は VacantHotelSearch 専用。SimpleHotelSearch で使うと 400 エラー。
+        必須: applicationId + 位置情報（下記のいずれか）
+          (A) latitude + longitude + datumType  ← datumType は必須
+          (B) keyword（ホテル名 or 地名）
+          (C) squareCode（楽天トラベルエリアコード）
+        ※ sort パラメータは省略（API デフォルト順）
 
-    ※ datumType パラメータは v20170426 では不要（送ると 400 エラーの原因になる）
+    datumType の値:
+        1 = 世界測地系 WGS84（GPS/OpenStreetMap/Google Maps で使用）
+        2 = 旧日本測地系
+
 ジオコーディング:
     Nominatim（OpenStreetMap）を使用。APIキー不要。
     主要新幹線駅は座標辞書からハードコード値を即時返却（高速・安定）。
@@ -290,8 +294,8 @@ def search_hotels_vacant_geo(
     """
     VacantHotelSearch/20170426 で緯度経度 + 日付から空室ホテルを検索する。
 
-    ※ datumType は削除（v20170426 では lat/lon と同時に送ると 400 の原因になる場合がある）
-    sort: +roomCharge（安い順）
+    datumType=1 (WGS84) は latitude/longitude 使用時の必須パラメータ。
+    省略すると 400 エラーになる。
     """
     checkout = (
         datetime.strptime(trip_date, "%Y-%m-%d") + timedelta(days=1)
@@ -301,6 +305,7 @@ def search_hotels_vacant_geo(
         "applicationId": _get_app_id(),
         "latitude":      round(latitude, 6),
         "longitude":     round(longitude, 6),
+        "datumType":     1,             # 必須: 1=WGS84（GPS/OSM 座標系）
         "searchRadius":  1.0,           # 半径1km
         "checkinDate":   trip_date,
         "checkoutDate":  checkout,
@@ -308,7 +313,7 @@ def search_hotels_vacant_geo(
         "roomNum":       1,
         "maxCharge":     budget,
         "hits":          hits,
-        "sort":          "+roomCharge",  # 安い順
+        "sort":          "+roomCharge",  # 安い順（VacantHotelSearch 専用の sort 値）
     }
     resp = requests.get(VACANT_HOTEL_URL, params=params, timeout=15)
     resp.raise_for_status()
@@ -324,19 +329,41 @@ def search_hotels_simple_geo(
     """
     SimpleHotelSearch/20170426 で緯度経度からホテルを検索する（日付なし）。
 
-    ※ datumType は削除（v20170426 では不要、送ると 400 の原因になる場合がある）
-    ※ sort パラメータは省略（デフォルト: standard）
-        +roomCharge / +hotelMinCharge ともに 400 になる環境があるため、
-        まず sort なしで動作確認してから正しい値を追加する。
+    datumType=1 (WGS84) は latitude/longitude 使用時の必須パラメータ。
+    sort は省略（SimpleHotelSearch の有効な sort 値は API バージョンによって異なるため）。
     """
     params = {
         "applicationId": _get_app_id(),
         "latitude":      round(latitude, 6),
         "longitude":     round(longitude, 6),
+        "datumType":     1,             # 必須: 1=WGS84
         "searchRadius":  1.0,
         "maxCharge":     budget,
         "hits":          hits,
-        # sort は意図的に省略（デフォルト順）
+        # sort は省略（デフォルト順）
+    }
+    resp = requests.get(SIMPLE_HOTEL_URL, params=params, timeout=15)
+    resp.raise_for_status()
+    return _parse_hotels_response(resp.json(), hits)
+
+
+def search_hotels_keyword(
+    keyword: str,
+    budget: int,
+    hits: int = 3,
+) -> list[dict]:
+    """
+    SimpleHotelSearch/20170426 でキーワード（駅名・地名）からホテルを検索する。
+
+    lat/lon が取得できない場合や緯度経度ベース検索が失敗した場合のフォールバック。
+    keyword パラメータは latitude/longitude と排他で使用できる。
+    """
+    params = {
+        "applicationId": _get_app_id(),
+        "keyword":       keyword,       # 駅名・地名をそのまま渡す
+        "maxCharge":     budget,
+        "hits":          hits,
+        # sort は省略（デフォルト順）
     }
     resp = requests.get(SIMPLE_HOTEL_URL, params=params, timeout=15)
     resp.raise_for_status()
@@ -351,10 +378,10 @@ def search_hotels(
     """
     楽天トラベルAPIで目的地駅周辺のホテルを最大3件検索する。
 
-    手順:
-      1. Nominatim / ハードコード辞書で目的地を緯度経度に変換
-      2. VacantHotelSearch (空室・日付あり) で検索
-      3. 失敗時: SimpleHotelSearch (日付なし) へフォールバック
+    検索順（フォールバック付き）:
+      1. VacantHotelSearch (lat/lon + datumType=1, 空室・日付あり)
+      2. SimpleHotelSearch (lat/lon + datumType=1, 日付なし)
+      3. SimpleHotelSearch (keyword=駅名, lat/lon 不要のフォールバック)
 
     Returns:
         (hotels, error_message)  — 正常時 error_message は None
@@ -364,34 +391,44 @@ def search_hotels(
     except EnvironmentError as e:
         return [], str(e)
 
-    # ジオコーディング
+    # ジオコーディング（フォールバック3ではスキップ可能）
     coords = geocode_station(destination)
-    if not coords:
-        return [], (
-            f"目的地「{destination}」の座標を取得できませんでした。\n"
-            "駅名を正確に入力してください（例: 名古屋、新大阪、博多）。"
-        )
-    lat, lon = coords
+    lat, lon = coords if coords else (None, None)
 
-    # 1. 空室検索（日付あり）
+    # 1. 空室検索（日付あり・lat/lon）
+    if lat is not None:
+        try:
+            hotels = search_hotels_vacant_geo(lat, lon, trip_date, budget)
+            if hotels:
+                return hotels, None
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else "?"
+            print(f"[search_hotel] VacantHotelSearch HTTP {status}: {e}")
+        except Exception as e:
+            print(f"[search_hotel] VacantHotelSearch エラー: {e}")
+
+        # 2. SimpleHotelSearch（日付なし・lat/lon）
+        try:
+            hotels = search_hotels_simple_geo(lat, lon, budget)
+            if hotels:
+                return hotels, None
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else "?"
+            print(f"[search_hotel] SimpleHotelSearch(geo) HTTP {status}: {e}")
+        except Exception as e:
+            print(f"[search_hotel] SimpleHotelSearch(geo) エラー: {e}")
+
+    # 3. キーワード検索フォールバック（lat/lon 不要）
+    print(f"[search_hotel] keyword フォールバック: {destination}")
     try:
-        hotels = search_hotels_vacant_geo(lat, lon, trip_date, budget)
+        hotels = search_hotels_keyword(destination, budget)
         if hotels:
             return hotels, None
+        return [], f"「{destination}」周辺のホテルが見つかりませんでした（予算: ¥{budget:,}円以下）。"
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else "?"
-        print(f"[search_hotel] VacantHotelSearch HTTP {status}: {e}")
-    except Exception as e:
-        print(f"[search_hotel] VacantHotelSearch エラー: {e}")
-
-    # 2. フォールバック（日付なし）
-    try:
-        hotels = search_hotels_simple_geo(lat, lon, budget)
-        return hotels, None
-    except requests.HTTPError as e:
-        status = e.response.status_code if e.response is not None else "?"
-        msg = f"楽天トラベルAPI エラー (HTTP {status}): {e}"
-        print(f"[search_hotel] SimpleHotelSearch {msg}")
+        msg = f"楽天トラベルAPI エラー (HTTP {status})\nURLを確認して .env の RAKUTEN_APP_ID を設定してください。"
+        print(f"[search_hotel] keyword HTTP {status}: {e}")
         return [], msg
     except Exception as e:
         msg = f"ホテル検索エラー: {e}"
