@@ -218,11 +218,14 @@ def _extract_segments_from_structure(item: Tag) -> list[dict]:
     """
     segments: list[dict] = []
 
-    # --- 方式 A: ul 内の li 要素を探す ---
+    # --- 方式 A: ul/ol 内の li 要素を探す ---
     route_ul = (
         item.select_one("ul.route")
         or item.select_one("ul.transportResult")
+        or item.select_one("ul.step")          # Yahoo Transit: ul.step
+        or item.select_one("ol.step")
         or item.select_one(".routeDetail ul")
+        or item.select_one(".routeDetail ol")
         or item.select_one("[class*='route'] > ul")
         or item.select_one("[class*='transport'] > ul")
     )
@@ -237,17 +240,21 @@ def _extract_segments_from_structure(item: Tag) -> list[dict]:
             item.select_one(".routeDetail")
             or item.select_one(".step")
             or item.select_one("[class*='detail']")
+            or item.select_one("[class*='step']")
         )
         if route_div:
             candidates = route_div.find_all(
-                ["div", "section"],
+                ["div", "section", "li"],
                 recursive=False,
             )
 
     for el in candidates:
         cls = " ".join(el.get("class", []))
 
-        if any(x in cls for x in ("station", "stop", "point", "dep", "arr")):
+        if any(x in cls for x in (
+            "station", "stop", "point", "dep", "arr",
+            "departure", "arrival",          # Yahoo Transit 新形式
+        )):
             # ---- 駅 ----
             time_el = (
                 el.select_one("em")
@@ -490,6 +497,35 @@ def _extract_segments(item: Tag) -> list[dict]:
     return deduped
 
 
+def _extract_text_trains(lines: list[str]) -> list[str]:
+    """
+    テキスト行から列車名・路線名を順番に抽出する（HTML構造非依存）。
+
+    連続する列車名行は結合する（「東海道新幹線」+「のぞみ316号」→「東海道新幹線 のぞみ316号」）。
+    """
+    trains: list[str] = []
+    prev_was_train = False
+
+    for line in lines:
+        if not _is_train_name_line(line) or _is_skip_line(line):
+            prev_was_train = False
+            continue
+        # 乗車時間注記（「1時間28分」など）を除去
+        clean = re.sub(r"[（(]\s*\d+時間\d*分?\s*[）)]", "", line)
+        clean = re.sub(r"[（(]\s*\d+分\s*[）)]", "", clean).strip()[:60]
+        if not clean:
+            prev_was_train = False
+            continue
+        # 直前も列車名なら連結（「東海道新幹線\nのぞみ316号」対応）
+        if prev_was_train and trains and clean not in trains[-1]:
+            trains[-1] = f"{trains[-1]} {clean}"[:60]
+        else:
+            trains.append(clean)
+        prev_was_train = True
+
+    return trains
+
+
 def _build_route_summary(segments: list[dict]) -> str:
     """セグメントリストから路線サマリー文字列を生成する。例: のぞみ123号 / JR神戸線→のぞみ316号"""
     trains = [s["name"] for s in segments if s["type"] == "train"]
@@ -508,8 +544,10 @@ def _parse_single_route(item: Tag, from_station: str, to_station: str) -> dict |
     - 料金: 全「XX,XXX円」パターンの最大値を採用（小さい数字の誤検知を除外）
     - 所要時間: 全マッチの最大値を採用（乗り換え時間など短い値の誤検知を除外）
     - 時刻: \b を使わない（日本語文字との境界で機能しないため）
+    - segments: HTML構造パース → テキストパース → フォールバック の3段階で取得
     """
     raw_text = item.get_text()
+    lines = [l.strip() for l in item.get_text("\n").split("\n") if l.strip()]
 
     # ---- 出発・到着時刻 ----
     all_times = [
@@ -545,11 +583,33 @@ def _parse_single_route(item: Tag, from_station: str, to_station: str) -> dict |
                     fare_max = n
                     fare = f"¥{m.group(1)}円"
 
-    # ---- セグメント（経路詳細）----
+    # ---- 列車名をテキストから直接抽出（HTML構造非依存・フォールバック用）----
+    text_trains = _extract_text_trains(lines)
+
+    # ---- セグメント（経路詳細）: HTML構造パース → テキストパース ----
     segments = _extract_segments(item)
 
+    seg_has_train   = any(s["type"] == "train"   for s in segments)
+    seg_has_station = sum(1 for s in segments if s["type"] == "station") >= 2
+
+    # ---- フォールバック段落構築 ----
+    # HTML/テキストパースが不完全な場合: dep/arr + text_trains で最低限の段落を生成
+    if not seg_has_train or not seg_has_station:
+        fb: list[dict] = []
+        fb.append({"type": "station", "name": from_station, "time": dep_time or ""})
+        for train_name in text_trains[:4]:
+            fb.append({"type": "train", "name": train_name})
+        fb.append({"type": "station", "name": to_station, "time": arr_time or ""})
+        segments = fb
+        seg_has_train = bool(text_trains)
+
     # ---- 路線サマリー ----
-    route_summary = _build_route_summary(segments) or f"{from_station}→{to_station}"
+    # segments から列車名 → なければ text_trains → なければ「出発→到着」
+    route_summary = _build_route_summary(segments)
+    if not route_summary and text_trains:
+        route_summary = "→".join(text_trains[:4])
+    if not route_summary:
+        route_summary = f"{from_station}→{to_station}"
 
     # ---- 予約サイト判定 ----
     booking = determine_booking_site(from_station, to_station, raw_text)
