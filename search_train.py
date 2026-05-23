@@ -526,6 +526,17 @@ def _extract_text_trains(lines: list[str]) -> list[str]:
     return trains
 
 
+def _extract_transfer_count(raw_text: str) -> int:
+    """乗換回数をテキストから抽出する。見つからない場合は -1 を返す。"""
+    m = re.search(r"乗換[：:]\s*(\d+)\s*回", raw_text)
+    if m:
+        return int(m.group(1))
+    # 「乗換0回」「乗換なし」など
+    if re.search(r"乗換なし|乗換：?0", raw_text):
+        return 0
+    return -1
+
+
 def _build_route_summary(segments: list[dict]) -> str:
     """セグメントリストから路線サマリー文字列を生成する。例: のぞみ123号 / JR神戸線→のぞみ316号"""
     trains = [s["name"] for s in segments if s["type"] == "train"]
@@ -536,18 +547,33 @@ def _build_route_summary(segments: list[dict]) -> str:
 # 単一経路パーサー
 # ============================================================
 
-def _parse_single_route(item: Tag, from_station: str, to_station: str) -> dict | None:
+def _parse_single_route(
+    item: Tag,
+    from_station: str,
+    to_station: str,
+    step_el: "Tag | None" = None,
+) -> "dict | None":
     """
     単一の経路要素をパースして辞書を返す。
+
+    Args:
+        item:         経路サマリー要素（li.routeWrap など）
+        from_station: 出発駅名
+        to_station:   到着駅名
+        step_el:      ステップ詳細要素（Yahoo Transit では routeWrap の外にある場合）
+                      None の場合は item のみを使用する
 
     ポイント:
     - 料金: 全「XX,XXX円」パターンの最大値を採用（小さい数字の誤検知を除外）
     - 所要時間: 全マッチの最大値を採用（乗り換え時間など短い値の誤検知を除外）
     - 時刻: \b を使わない（日本語文字との境界で機能しないため）
-    - segments: HTML構造パース → テキストパース → フォールバック の3段階で取得
+    - segments: step_el → item 構造パース → テキストパース → フォールバック
     """
     raw_text = item.get_text()
     lines = [l.strip() for l in item.get_text("\n").split("\n") if l.strip()]
+    # step_el があればそのテキスト行も追加（列車名・駅名の取得用）
+    if step_el:
+        lines = lines + [l.strip() for l in step_el.get_text("\n").split("\n") if l.strip()]
 
     # ---- 出発・到着時刻 ----
     all_times = [
@@ -583,25 +609,48 @@ def _parse_single_route(item: Tag, from_station: str, to_station: str) -> dict |
                     fare_max = n
                     fare = f"¥{m.group(1)}円"
 
+    # ---- 乗換回数を抽出 ----
+    transfer_count = _extract_transfer_count(raw_text)
+
     # ---- 列車名をテキストから直接抽出（HTML構造非依存・フォールバック用）----
     text_trains = _extract_text_trains(lines)
 
-    # ---- セグメント（経路詳細）: HTML構造パース → テキストパース ----
-    segments = _extract_segments(item)
+    # ---- セグメント（経路詳細）: step_el → item 構造パース → テキストパース ----
+    # 1. step_el があれば優先的に試みる（Yahoo Transit では routeWrap 外にステップがある）
+    segments: list[dict] = []
+    if step_el:
+        segments = _extract_segments(step_el)
+    # 2. step_el から取得できなければ item 自身を解析
+    if not (any(s["type"] == "train" for s in segments) and
+            sum(1 for s in segments if s["type"] == "station") >= 2):
+        segments = _extract_segments(item)
 
     seg_has_train   = any(s["type"] == "train"   for s in segments)
     seg_has_station = sum(1 for s in segments if s["type"] == "station") >= 2
 
     # ---- フォールバック段落構築 ----
-    # HTML/テキストパースが不完全な場合: dep/arr + text_trains で最低限の段落を生成
+    # HTML/テキストパースが不完全な場合: dep/arr + 利用可能情報で段落を生成
     if not seg_has_train or not seg_has_station:
         fb: list[dict] = []
         fb.append({"type": "station", "name": from_station, "time": dep_time or ""})
-        for train_name in text_trains[:4]:
-            fb.append({"type": "train", "name": train_name})
+
+        if text_trains:
+            # テキストから列車名が取得できた場合
+            for train_name in text_trains[:4]:
+                fb.append({"type": "train", "name": train_name})
+        else:
+            # 列車名未取得：乗換回数で代替表示（1エントリにまとめる）
+            if transfer_count == 0:
+                label = "直通（列車名は下のボタンで確認）"
+            elif transfer_count > 0:
+                label = f"乗換{transfer_count}回（詳細は下のボタンで確認）"
+            else:
+                label = "（詳細は下のボタンで確認）"
+            fb.append({"type": "train", "name": label})
+
         fb.append({"type": "station", "name": to_station, "time": arr_time or ""})
         segments = fb
-        seg_has_train = bool(text_trains)
+        seg_has_train = True
 
     # ---- 路線サマリー ----
     # segments から列車名 → なければ text_trains → なければ「出発→到着」
@@ -651,12 +700,38 @@ def parse_routes(soup: BeautifulSoup, from_station: str, to_station: str) -> lis
         or soup.select("div[class*='route']")
     )
 
+    # ---- ページ全体からステップ詳細コンテナを探す ----
+    # Yahoo Transit では routeWrap の外（兄弟要素や別セクション）にある場合がある
+    page_step_lists: list[Tag] = (
+        soup.select("ul.step")
+        or soup.select("ol.step")
+        or soup.select("[class*='routeDetail'] ul")
+        or soup.select("[class*='routeResult'] ul")
+        or []
+    )
+
     results: list[dict] = []
     seen_keys: set[tuple] = set()
 
-    for item in route_items:
+    for idx, item in enumerate(route_items):
+        # このルートに対応するステップ要素を決定
+        step_el: "Tag | None" = None
+
+        # 方法1: ページ全体のステップリストからインデックスで対応付け
+        if idx < len(page_step_lists):
+            step_el = page_step_lists[idx]
+
+        # 方法2: 次の兄弟要素（routeWrap でないもの）にステップがある場合
+        if not step_el:
+            nxt = item.find_next_sibling()
+            if nxt and "routeWrap" not in " ".join(nxt.get("class", [])):
+                # 次の兄弟がステップ情報を持つか簡易確認
+                nxt_text = nxt.get_text()
+                if any(c in nxt_text for c in ["号", "新幹線", "線", "発", "着"]):
+                    step_el = nxt
+
         try:
-            route_info = _parse_single_route(item, from_station, to_station)
+            route_info = _parse_single_route(item, from_station, to_station, step_el=step_el)
             if not route_info:
                 continue
 
