@@ -284,6 +284,12 @@ def _parse_hotels_response(data: dict, hits: int) -> list[dict]:
     return results[:hits]
 
 
+def _debug_url(url: str, params: dict) -> None:
+    """デバッグ用: リクエストURLをコンソールに出力する。"""
+    req = requests.Request("GET", url, params=params).prepare()
+    print(f"[search_hotel] リクエストURL: {req.url}")
+
+
 def search_hotels_vacant_geo(
     latitude: float,
     longitude: float,
@@ -303,6 +309,7 @@ def search_hotels_vacant_geo(
 
     params = {
         "applicationId": _get_app_id(),
+        "format":        "json",
         "latitude":      round(latitude, 6),
         "longitude":     round(longitude, 6),
         "datumType":     1,             # 必須: 1=WGS84（GPS/OSM 座標系）
@@ -315,6 +322,7 @@ def search_hotels_vacant_geo(
         "hits":          hits,
         "sort":          "+roomCharge",  # 安い順（VacantHotelSearch 専用の sort 値）
     }
+    _debug_url(VACANT_HOTEL_URL, params)
     resp = requests.get(VACANT_HOTEL_URL, params=params, timeout=15)
     resp.raise_for_status()
     return _parse_hotels_response(resp.json(), hits)
@@ -334,6 +342,7 @@ def search_hotels_simple_geo(
     """
     params = {
         "applicationId": _get_app_id(),
+        "format":        "json",
         "latitude":      round(latitude, 6),
         "longitude":     round(longitude, 6),
         "datumType":     1,             # 必須: 1=WGS84
@@ -342,6 +351,7 @@ def search_hotels_simple_geo(
         "hits":          hits,
         # sort は省略（デフォルト順）
     }
+    _debug_url(SIMPLE_HOTEL_URL, params)
     resp = requests.get(SIMPLE_HOTEL_URL, params=params, timeout=15)
     resp.raise_for_status()
     return _parse_hotels_response(resp.json(), hits)
@@ -357,17 +367,24 @@ def search_hotels_keyword(
 
     lat/lon が取得できない場合や緯度経度ベース検索が失敗した場合のフォールバック。
     keyword パラメータは latitude/longitude と排他で使用できる。
+    最小パラメータ: applicationId + format + keyword + hits
     """
     params = {
         "applicationId": _get_app_id(),
+        "format":        "json",
         "keyword":       keyword,       # 駅名・地名をそのまま渡す
-        "maxCharge":     budget,
         "hits":          hits,
-        # sort は省略（デフォルト順）
+        # maxCharge は除外（パラメータを最小限に絞ってテスト）
     }
+    _debug_url(SIMPLE_HOTEL_URL, params)
     resp = requests.get(SIMPLE_HOTEL_URL, params=params, timeout=15)
     resp.raise_for_status()
-    return _parse_hotels_response(resp.json(), hits)
+
+    # maxCharge でクライアント側フィルタリング
+    hotels = _parse_hotels_response(resp.json(), hits * 2)
+    if budget:
+        hotels = [h for h in hotels if h.get("min_charge_raw") is None or h["min_charge_raw"] <= budget]
+    return hotels[:hits]
 
 
 def _extract_api_error(e: "requests.HTTPError") -> str:
