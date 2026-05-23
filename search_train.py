@@ -11,6 +11,7 @@ import requests
 from bs4 import BeautifulSoup
 
 YAHOO_TRANSIT_BASE = "https://transit.yahoo.co.jp/search/result"
+YAHOO_TRANSIT_TOP = "https://transit.yahoo.co.jp/"
 
 # 東北・北海道・上越・北陸方面の主要駅キーワード（えきねっと対象路線判定用）
 EKINET_KEYWORDS = [
@@ -20,7 +21,11 @@ EKINET_KEYWORDS = [
     "大宮", "高崎", "軽井沢",
 ]
 
-YAHOO_TRANSIT_TOP = "https://transit.yahoo.co.jp/"
+# 乗り換え案内・所要時間で混入しやすい短い「XX分」を誤検知しないための下限（分）
+# 新幹線+在来線で最短でも30分程度はかかる
+_MIN_DURATION_MINUTES = 20
+# 新幹線料金の最低ライン（これ以下は誤検知と判断）
+_MIN_FARE_YEN = 500
 
 HEADERS = {
     "User-Agent": (
@@ -74,9 +79,6 @@ def build_yahoo_url(from_station: str, to_station: str, arrival_time: str, trip_
 def determine_booking_site(from_station: str, to_station: str, route_text: str = "") -> dict:
     """
     出発地・目的地・経路テキストからどの予約サイトを使うか判定する。
-
-    Returns:
-        dict: {"name": サイト名, "url": URL}
     """
     combined = f"{from_station} {to_station} {route_text}"
     for kw in EKINET_KEYWORDS:
@@ -85,120 +87,113 @@ def determine_booking_site(from_station: str, to_station: str, route_text: str =
                 "name": "JR東日本 えきねっと",
                 "url": "https://www.eki-net.com/top/index.html",
             }
-    # デフォルトはJR東海EX予約（東海道・山陽新幹線）
     return {
         "name": "JR東海 EX予約",
         "url": "https://expy.jp/",
     }
 
 
-def parse_duration(text: str) -> str:
-    """'1時間30分' など所要時間テキストを正規化する。"""
+def _duration_to_minutes(text: str) -> int:
+    """「X時間Y分」「X時間」「Y分」形式の文字列を分数に変換する。"""
     text = re.sub(r"\s+", "", text)
-    # 「XX時間XX分」パターン
-    m = re.search(r"(\d+)時間(\d+)分", text)
+    m = re.match(r"(\d+)時間(\d+)分", text)
     if m:
-        return f"{m.group(1)}時間{m.group(2)}分"
-    m = re.search(r"(\d+)時間", text)
+        return int(m.group(1)) * 60 + int(m.group(2))
+    m = re.match(r"(\d+)時間$", text)
     if m:
-        return f"{m.group(1)}時間"
-    m = re.search(r"(\d+)分", text)
+        return int(m.group(1)) * 60
+    m = re.match(r"(\d+)分$", text)
     if m:
-        return f"{m.group(1)}分"
-    return text
+        return int(m.group(1))
+    return 0
 
 
-def parse_fare(text: str) -> str:
-    """料金テキストから数字部分を抽出して整形する。"""
-    text = re.sub(r"\s+", "", text)
-    m = re.search(r"[\d,，]+", text)
-    if m:
-        digits = re.sub(r"[，,]", ",", m.group())
-        return f"¥{digits}円"
-    return text
-
-
-def parse_routes(soup: BeautifulSoup, from_station: str, to_station: str) -> list[dict]:
-    """BeautifulSoupオブジェクトから経路候補を最大3件パースして返す。"""
-    results = []
-
-    # Yahoo!乗換案内の経路一覧コンテナを探す
-    route_items = soup.select("li.routeWrap")
-    if not route_items:
-        route_items = soup.select("section.routeWrap")
-    if not route_items:
-        # フォールバック: routeという語を含むdivを探す
-        route_items = soup.select("div[class*='route']")
-
-    for item in route_items[:3]:
-        try:
-            route_info = _parse_single_route(item, from_station, to_station)
-            if route_info:
-                results.append(route_info)
-        except Exception:
-            continue
-
-    return results
+def _minutes_to_str(minutes: int) -> str:
+    """分数を「X時間Y分」形式に変換する。"""
+    if minutes <= 0:
+        return ""
+    h, m = divmod(minutes, 60)
+    if h > 0 and m > 0:
+        return f"{h}時間{m}分"
+    if h > 0:
+        return f"{h}時間"
+    return f"{m}分"
 
 
 def _parse_single_route(item, from_station: str, to_station: str) -> dict | None:
-    """単一の経路要素をパースして辞書を返す。"""
+    """
+    単一の経路要素をパースして辞書を返す。
+
+    ポイント:
+    - 料金は「XX,XXX円」形式で最大値を採用（小さい数字の誤検知を除外）
+    - 所要時間は最長マッチを採用（乗り換え時間など短い値の誤検知を除外）
+    - 時刻は全テキストから先頭・末尾を出発・到着とみなす
+    """
+    raw_text = item.get_text()
 
     # ---- 出発・到着時刻 ----
-    time_elems = item.select(".time, .timeWrap, [class*='time']")
-    dep_time = arr_time = ""
-    if time_elems:
-        times_text = [t.get_text(strip=True) for t in time_elems if re.search(r"\d{1,2}:\d{2}", t.get_text())]
-        time_matches = []
-        for t in times_text:
-            time_matches += re.findall(r"\d{1,2}:\d{2}", t)
-        if len(time_matches) >= 2:
-            dep_time = time_matches[0]
-            arr_time = time_matches[-1]
-        elif len(time_matches) == 1:
-            arr_time = time_matches[0]
-
-    # 時刻が取れなかった場合、テキスト全体から抽出
-    if not dep_time or not arr_time:
-        all_times = re.findall(r"\d{1,2}:\d{2}", item.get_text())
-        if len(all_times) >= 2:
-            dep_time = all_times[0]
-            arr_time = all_times[-1]
+    # HH:MM 形式（00:00〜23:59）を全て抽出
+    # ※ \b は日本語文字との境界では機能しないため使わない（例: "07:00発" の「発」）
+    all_times = re.findall(r"(\d{1,2}:\d{2})", raw_text)
+    valid_times = [
+        t for t in all_times
+        if 0 <= int(t.split(":")[0]) <= 23 and 0 <= int(t.split(":")[1]) <= 59
+    ]
+    dep_time = valid_times[0] if len(valid_times) >= 1 else ""
+    arr_time = valid_times[-1] if len(valid_times) >= 2 else (valid_times[0] if valid_times else "")
 
     # ---- 所要時間 ----
-    duration = ""
-    dur_elem = item.select_one(".time, .totalTime, [class*='time']")
-    raw_text = item.get_text()
-    dur_m = re.search(r"(\d+時間\d+分|\d+時間|\d+分)", raw_text)
-    if dur_m:
-        duration = parse_duration(dur_m.group(1))
+    # 全マッチを分数に変換し、最大値（= 総所要時間）を採用
+    # → 乗り換え時間の「5分」「10分」より総所要時間の「2時間15分」が勝つ
+    dur_matches = re.findall(r"\d+時間\d+分|\d+時間|\d+分", raw_text)
+    best_minutes = 0
+    for dm in dur_matches:
+        mins = _duration_to_minutes(dm)
+        if mins > best_minutes:
+            best_minutes = mins
+    duration = _minutes_to_str(best_minutes) if best_minutes >= _MIN_DURATION_MINUTES else ""
 
     # ---- 料金 ----
+    # 「XX,XXX円」形式を全て抽出し最大値を採用
+    # → 「2円」のような誤検知は _MIN_FARE_YEN で除外
     fare = ""
-    fare_elem = item.select_one(".fare, .price, [class*='fare'], [class*='price']")
-    if fare_elem:
-        fare = parse_fare(fare_elem.get_text())
+    fare_max = 0
+    # パターン1: 「14,380円」「1,500円」など
+    for m in re.finditer(r"([\d,]+)円", raw_text):
+        raw_num = m.group(1).replace(",", "")
+        if raw_num.isdigit():
+            n = int(raw_num)
+            if n >= _MIN_FARE_YEN and n > fare_max:
+                fare_max = n
+                # 元の表記（カンマ区切り）を使う
+                fare = f"¥{m.group(1)}円"
+    # パターン2: 「¥14,380」など（"円"なし）
     if not fare:
-        fare_m = re.search(r"([\d,]+)\s*円", raw_text)
-        if fare_m:
-            fare = f"¥{fare_m.group(1)}円"
+        for m in re.finditer(r"¥\s*([\d,]+)", raw_text):
+            raw_num = m.group(1).replace(",", "")
+            if raw_num.isdigit():
+                n = int(raw_num)
+                if n >= _MIN_FARE_YEN and n > fare_max:
+                    fare_max = n
+                    fare = f"¥{m.group(1)}円"
 
-    # ---- 路線名（新幹線名など） ----
+    # ---- 路線名 ----
+    train_elems = item.select(
+        ".transport, .trainName, [class*='transport'], [class*='train'], [class*='line']"
+    )
     train_names = []
-    train_elems = item.select(".transport, .trainName, [class*='transport'], [class*='train']")
+    seen_names: set[str] = set()
     for el in train_elems:
         txt = el.get_text(strip=True)
-        if txt and "新幹線" in txt or "のぞみ" in txt or "ひかり" in txt or "はやぶさ" in txt:
+        if txt and txt not in seen_names:
+            seen_names.add(txt)
             train_names.append(txt)
-        elif txt:
-            train_names.append(txt)
-
-    route_summary = "、".join(train_names[:3]) if train_names else f"{from_station}→{to_station}"
-    route_text = item.get_text()
+    route_summary = "、".join(train_names[:4]) if train_names else f"{from_station}→{to_station}"
 
     # ---- 予約サイト判定 ----
-    booking = determine_booking_site(from_station, to_station, route_text)
+    booking = determine_booking_site(from_station, to_station, raw_text)
 
+    # 時刻・所要時間・料金のいずれも取れなかった場合は無効とみなす
     if not dep_time and not arr_time and not duration and not fare:
         return None
 
@@ -213,6 +208,47 @@ def _parse_single_route(item, from_station: str, to_station: str) -> dict | None
     }
 
 
+def parse_routes(soup: BeautifulSoup, from_station: str, to_station: str) -> list[dict]:
+    """BeautifulSoupオブジェクトから経路候補を最大3件パースして返す。"""
+
+    # Yahoo!乗換案内の経路一覧コンテナを探す
+    route_items = soup.select("li.routeWrap")
+    if not route_items:
+        route_items = soup.select("section.routeWrap")
+    if not route_items:
+        # フォールバック: routeという語を含む div（広めだが最終手段）
+        route_items = soup.select("div[class*='route']")
+
+    results = []
+    seen_keys: set[tuple] = set()   # 重複除外用: (dep_time, arr_time) のセット
+
+    for item in route_items:
+        try:
+            route_info = _parse_single_route(item, from_station, to_station)
+            if not route_info:
+                continue
+
+            # (出発時刻, 到着時刻) が同じ候補は重複として除外
+            # 時刻がどちらも取れない場合は (料金, 所要時間) を補助キーとして使う
+            dep = route_info["dep_time"]
+            arr = route_info["arr_time"]
+            if dep == "—" and arr == "—":
+                key = (route_info["fare"], route_info["duration"])
+            else:
+                key = (dep, arr)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            results.append(route_info)
+            if len(results) >= 3:
+                break
+        except Exception:
+            continue
+
+    return results
+
+
 def _make_session() -> requests.Session:
     """
     Cookie付きセッションを作成する。
@@ -221,11 +257,10 @@ def _make_session() -> requests.Session:
     session = requests.Session()
     session.headers.update(HEADERS)
     try:
-        # トップページにアクセスしてCookieを取得
         resp = session.get(YAHOO_TRANSIT_TOP, timeout=10)
         resp.raise_for_status()
     except Exception:
-        pass  # Cookie取得失敗でも続行
+        pass
     return session
 
 
@@ -248,7 +283,6 @@ def search_trains(
 
     try:
         session = _make_session()
-        # Refererヘッダーを追加してからリクエスト
         session.headers["Referer"] = YAHOO_TRANSIT_TOP
         resp = session.get(yahoo_url, timeout=15)
         resp.raise_for_status()
@@ -262,7 +296,7 @@ def search_trains(
     except Exception as e:
         print(f"[search_train] パースエラー: {e}")
 
-    # パース失敗時のフォールバック: Yahoo!乗換案内URLは有効なので案内を表示
+    # パース失敗時のフォールバック
     if not routes:
         booking = determine_booking_site(from_station, to_station)
         routes = [
