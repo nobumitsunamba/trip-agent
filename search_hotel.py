@@ -325,8 +325,9 @@ def search_hotels_simple_geo(
     SimpleHotelSearch/20170426 で緯度経度からホテルを検索する（日付なし）。
 
     ※ datumType は削除（v20170426 では不要、送ると 400 の原因になる場合がある）
-    sort: +hotelMinCharge（安い順）
-        ※ roomCharge は VacantHotelSearch 専用。SimpleHotelSearch で使うと 400 エラー。
+    ※ sort パラメータは省略（デフォルト: standard）
+        +roomCharge / +hotelMinCharge ともに 400 になる環境があるため、
+        まず sort なしで動作確認してから正しい値を追加する。
     """
     params = {
         "applicationId": _get_app_id(),
@@ -335,7 +336,7 @@ def search_hotels_simple_geo(
         "searchRadius":  1.0,
         "maxCharge":     budget,
         "hits":          hits,
-        "sort":          "+hotelMinCharge",  # SimpleHotelSearch は hotelMinCharge を使用
+        # sort は意図的に省略（デフォルト順）
     }
     resp = requests.get(SIMPLE_HOTEL_URL, params=params, timeout=15)
     resp.raise_for_status()
