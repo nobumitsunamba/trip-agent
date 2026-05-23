@@ -7,7 +7,7 @@ main.py
 
 必要な準備:
     1. pip install -r requirements.txt
-    2. .env ファイルに RAKUTEN_APP_ID=<楽天アプリID> を設定
+    （APIキーは不要。楽天トラベル・じゃらんの検索URLを自動生成します）
 """
 
 import json
@@ -17,7 +17,7 @@ import tkinter as tk
 import webbrowser
 from tkinter import messagebox, ttk
 
-from search_hotel import search_hotels
+from search_hotel import build_hotel_search_urls
 from search_train import search_trains
 
 # ============================================================
@@ -42,6 +42,8 @@ BTN_PRIMARY = "#3498DB"
 BTN_TRAIN_BOOK = "#E67E22"
 BTN_HOTEL_BOOK = "#27AE60"
 BTN_YAHOO = "#6C63FF"
+BTN_RAKUTEN = "#BF0000"   # 楽天トラベル（ブランドレッド）
+BTN_JALAN   = "#E85500"   # じゃらん（ブランドオレンジ）
 BTN_FG = "#FFFFFF"
 LABEL_FG = "#2C3E50"
 MUTED_FG = "#7F8C8D"
@@ -130,7 +132,7 @@ class TripAgentApp(tk.Tk):
 
         self._last_input = load_last_input()
         self._train_results: list[dict] = []
-        self._hotel_results: list[dict] = []
+        self._hotel_urls: dict = {}   # build_hotel_search_urls の戻り値
         self._yahoo_url: str = ""
 
         self._build_ui()
@@ -302,19 +304,18 @@ class TripAgentApp(tk.Tk):
             "hotel_budget": budget,
         })
 
-        # ローディング表示
+        # ローディング表示（新幹線のみ非同期）
         self._bar_train = self._show_loading(self._train_frame, "新幹線を検索中...")
-        self._bar_hotel = self._show_loading(self._hotel_frame, "ホテルを検索中...")
+        self._show_placeholder(self._hotel_frame, "ホテル検索リンクを生成中...")
 
-        # バックグラウンドで検索実行
+        # ホテルURLは即時生成（API不要）
+        self._hotel_urls = build_hotel_search_urls(to_st, trip_date, budget)
+        self.after(0, self._render_hotel_search_links)
+
+        # 新幹線はバックグラウンドで検索
         threading.Thread(
             target=self._run_train_search,
             args=(from_st, to_st, arr_time, trip_date),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=self._run_hotel_search,
-            args=(to_st, trip_date, budget),
             daemon=True,
         ).start()
 
@@ -330,17 +331,7 @@ class TripAgentApp(tk.Tk):
         finally:
             self.after(0, self._render_train_results)
 
-    def _run_hotel_search(self, destination, trip_date, budget):
-        try:
-            hotels, err = search_hotels(destination, trip_date, budget)
-            self._hotel_results = hotels
-            self._hotel_error = err
-        except Exception as e:
-            self._hotel_results = []
-            self._hotel_error = str(e)
-            print(f"[main] ホテル検索エラー: {e}")
-        finally:
-            self.after(0, self._render_hotel_results)
+    # _run_hotel_search は削除（URLは即時生成のため不要）
 
     # ----------------------------------------------------------
     # 結果レンダリング
@@ -468,90 +459,79 @@ class TripAgentApp(tk.Tk):
             bg=BTN_TRAIN_BOOK, padx=10, pady=5,
         ).grid(row=row, column=1, columnspan=3, sticky="w", padx=4, pady=(4, 8))
 
-    def _render_hotel_results(self):
+    def _render_hotel_search_links(self):
+        """ホテル検索リンクエリアを描画する（楽天トラベル・じゃらんのボタン）。"""
         for w in self._hotel_frame.winfo_children():
             w.destroy()
 
-        err = getattr(self, "_hotel_error", None)
-        if err:
-            tk.Label(
-                self._hotel_frame, text=err,
-                font=FONT_SMALL, fg=ERROR_FG, bg=APP_BG,
-                wraplength=420, justify="left",
-            ).pack(pady=12, padx=8, anchor="w")
+        urls = self._hotel_urls
+        if not urls:
+            self._show_placeholder(self._hotel_frame, "検索条件を入力してください")
             return
 
-        if not self._hotel_results:
-            self._show_placeholder(self._hotel_frame, "ホテルの検索結果がありませんでした")
-            return
-
-        for i, hotel in enumerate(self._hotel_results):
-            self._build_hotel_card(self._hotel_frame, hotel, i + 1)
-
-    def _build_hotel_card(self, parent: tk.Frame, hotel: dict, index: int):
-        card = tk.Frame(
-            parent, bg=CARD_BG,
+        # ---- 検索条件サマリーカード ----
+        summary_card = tk.Frame(
+            self._hotel_frame, bg=CARD_BG,
             relief="solid", bd=1,
             highlightbackground=CARD_BORDER,
         )
-        card.pack(fill="x", padx=4, pady=4)
-        card.columnconfigure(1, weight=1)
+        summary_card.pack(fill="x", padx=4, pady=(4, 8))
 
-        # カード左：番号バッジ
-        badge = tk.Label(
-            card, text=f" {index} ",
-            font=(FONT_BASE[0], 13, "bold"),
-            bg=BTN_HOTEL_BOOK, fg=BTN_FG,
-            width=3,
-        )
-        badge.grid(row=0, column=0, rowspan=5, sticky="ns", padx=(0, 8))
-
-        # ホテル名
         tk.Label(
-            card, text=hotel.get("name", "—"),
+            summary_card, text="🔍  検索条件",
             font=FONT_BOLD, fg=LABEL_FG, bg=CARD_BG, anchor="w",
-            wraplength=360,
-        ).grid(row=0, column=1, columnspan=2, sticky="w", padx=4, pady=(6, 2))
+        ).pack(anchor="w", padx=12, pady=(10, 4))
 
-        # アクセス
-        access = hotel.get("access", "")
-        if access:
+        sep = tk.Frame(summary_card, bg=CARD_BORDER, height=1)
+        sep.pack(fill="x", padx=8, pady=(0, 6))
+
+        # 条件テキスト
+        budget     = urls["budget"]
+        checkin    = urls["checkin_date"]
+        checkout   = urls["checkout_date"]
+        dest       = urls["destination"]
+
+        info_frame = tk.Frame(summary_card, bg=CARD_BG)
+        info_frame.pack(anchor="w", padx=12, pady=(0, 10))
+
+        conditions = [
+            ("📍 目的地",       dest),
+            ("📅 チェックイン",  checkin),
+            ("📅 チェックアウト", checkout),
+            ("💴 予算上限",     f"¥{budget:,}円以下 / 泊"),
+        ]
+        for row_idx, (label, value) in enumerate(conditions):
             tk.Label(
-                card, text=f"🚉 {access}",
-                font=FONT_SMALL, fg=MUTED_FG, bg=CARD_BG, anchor="w",
-                wraplength=360,
-            ).grid(row=1, column=1, columnspan=2, sticky="w", padx=4, pady=1)
-
-        # 住所
-        address = hotel.get("address", "")
-        if address:
+                info_frame, text=label,
+                font=FONT_SMALL, fg=MUTED_FG, bg=CARD_BG, anchor="w", width=14,
+            ).grid(row=row_idx, column=0, sticky="w", pady=2)
             tk.Label(
-                card, text=f"📍 {address}",
-                font=FONT_SMALL, fg=MUTED_FG, bg=CARD_BG, anchor="w",
-                wraplength=360,
-            ).grid(row=2, column=1, columnspan=2, sticky="w", padx=4, pady=1)
+                info_frame, text=value,
+                font=FONT_BOLD, fg=LABEL_FG, bg=CARD_BG, anchor="w",
+            ).grid(row=row_idx, column=1, sticky="w", padx=(4, 0), pady=2)
 
-        # 料金・評価
-        price_review_frame = tk.Frame(card, bg=CARD_BG)
-        price_review_frame.grid(row=3, column=1, columnspan=2, sticky="w", padx=4, pady=2)
-
-        tk.Label(
-            price_review_frame, text=hotel.get("price", "—"),
-            font=(FONT_BASE[0], 12, "bold"), fg=BTN_TRAIN_BOOK, bg=CARD_BG,
-        ).pack(side="left", padx=(0, 16))
-        tk.Label(
-            price_review_frame, text=hotel.get("review", "—"),
-            font=FONT_BASE, fg="#F39C12", bg=CARD_BG,
-        ).pack(side="left")
-
-        # 予約ボタン
-        booking_url = hotel.get("booking_url", "")
+        # ---- 楽天トラベルで検索ボタン ----
         make_button(
-            card,
-            "🏨 楽天トラベルで予約する",
-            lambda url=booking_url: webbrowser.open(url),
-            bg=BTN_HOTEL_BOOK, padx=10, pady=5,
-        ).grid(row=4, column=1, columnspan=2, sticky="w", padx=4, pady=(4, 8))
+            self._hotel_frame,
+            "🏨  楽天トラベルで検索する  →",
+            lambda: webbrowser.open(urls["rakuten_url"]),
+            bg=BTN_RAKUTEN, padx=12, pady=10, font=FONT_BOLD,
+        ).pack(fill="x", padx=4, pady=(0, 6))
+
+        # ---- じゃらんで検索ボタン ----
+        make_button(
+            self._hotel_frame,
+            "🏯  じゃらんで検索する  →",
+            lambda: webbrowser.open(urls["jalan_url"]),
+            bg=BTN_JALAN, padx=12, pady=10, font=FONT_BOLD,
+        ).pack(fill="x", padx=4, pady=(0, 4))
+
+        # ---- ヒントテキスト ----
+        tk.Label(
+            self._hotel_frame,
+            text="※ ボタンをクリックするとブラウザで検索結果が開きます",
+            font=FONT_SMALL, fg=MUTED_FG, bg=APP_BG,
+        ).pack(anchor="w", padx=8, pady=(2, 0))
 
 
 # ============================================================
