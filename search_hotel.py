@@ -7,6 +7,10 @@ search_hotel.py
         RAKUTEN_APP_ID=<楽天アプリID>
 
     楽天アプリIDは https://webservice.rakuten.co.jp/ で取得できます。
+
+API仕様:
+    VacantHotelSearch  https://webservice.rakuten.co.jp/documentation/vacant-hotel-search
+    KeywordHotelSearch https://webservice.rakuten.co.jp/documentation/keyword-hotel-search
 """
 
 import os
@@ -48,10 +52,45 @@ def _build_hotel_url(hotel_no: str | int) -> str:
     return f"https://hotel.travel.rakuten.co.jp/hotelinfo/plan/list/{hotel_no}/"
 
 
-def parse_hotel_info(hotel_data: dict) -> dict | None:
+def _extract_hotel_basic_info(hotel_wrap) -> dict:
+    """
+    APIレスポンスの1件エントリから hotelBasicInfo 辞書を取り出す。
+
+    楽天トラベルAPIのレスポンス形式（formatVersion指定なし・デフォルト）:
+        hotels: [
+            {
+                "hotel": [
+                    {"hotelBasicInfo": {...}},
+                    {"hotelRatingInfo": {...}},
+                    ...
+                ]
+            },
+            ...
+        ]
+    """
+    # hotel_wrap が {"hotel": [...]} の形の dict
+    if isinstance(hotel_wrap, dict) and "hotel" in hotel_wrap:
+        hotel_list = hotel_wrap["hotel"]
+        for entry in hotel_list:
+            if isinstance(entry, dict) and "hotelBasicInfo" in entry:
+                return entry["hotelBasicInfo"]
+
+    # hotel_wrap が直接リストの場合（formatVersion=2 等）
+    if isinstance(hotel_wrap, list):
+        for entry in hotel_wrap:
+            if isinstance(entry, dict) and "hotelBasicInfo" in entry:
+                return entry["hotelBasicInfo"]
+
+    return {}
+
+
+def parse_hotel_info(hotel_wrap) -> dict | None:
     """楽天トラベルAPIのレスポンスから1件のホテル情報を抽出する。"""
     try:
-        basic = hotel_data.get("hotelBasicInfo", {})
+        basic = _extract_hotel_basic_info(hotel_wrap)
+        if not basic:
+            return None
+
         hotel_no = basic.get("hotelNo", "")
         name = basic.get("hotelName", "不明")
         address = (basic.get("address1", "") + basic.get("address2", "")).strip()
@@ -59,7 +98,6 @@ def parse_hotel_info(hotel_data: dict) -> dict | None:
         review_avg = basic.get("reviewAverage")
         access = basic.get("access", "")
         hotel_url = basic.get("hotelInformationUrl") or _build_hotel_url(hotel_no)
-        image_url = basic.get("hotelImageUrl", "")
 
         return {
             "hotel_no": str(hotel_no),
@@ -70,10 +108,20 @@ def parse_hotel_info(hotel_data: dict) -> dict | None:
             "review": f"★{review_avg}" if review_avg else "—",
             "access": access,
             "booking_url": hotel_url,
-            "image_url": image_url,
         }
     except Exception:
         return None
+
+
+def _parse_hotels_response(data: dict, hits: int) -> list[dict]:
+    """APIレスポンス JSON からホテルリストをパースして返す。"""
+    hotels_raw = data.get("hotels", [])
+    results = []
+    for hotel_wrap in hotels_raw:
+        info = parse_hotel_info(hotel_wrap)
+        if info:
+            results.append(info)
+    return results[:hits]
 
 
 def search_hotels_vacant(
@@ -84,45 +132,30 @@ def search_hotels_vacant(
 ) -> list[dict]:
     """
     VacantHotelSearch API（空室検索）でホテルを検索する。
-    チェックイン日=trip_date、チェックアウト=翌日、1泊の条件。
+    チェックイン=trip_date、チェックアウト=翌日、大人1名1室。
+
+    有効なsortパラメータ: +roomCharge, -roomCharge,
+                          +hotelReviewAverage, -hotelReviewAverage
     """
     app_id = _get_app_id()
-    checkin = trip_date  # YYYY-MM-DD
-    dt = datetime.strptime(trip_date, "%Y-%m-%d")
-    checkout = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
+    checkin = trip_date
+    checkout = (datetime.strptime(trip_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
 
     params = {
         "applicationId": app_id,
         "keyword": keyword,
         "checkinDate": checkin,
         "checkoutDate": checkout,
+        "adultNum": 1,
+        "roomNum": 1,
         "maxCharge": budget,
         "hits": hits,
-        "sort": "+roomCharge",   # 料金の安い順
-        "datumType": 1,          # 世界測地系
-        "formatVersion": 2,
+        "sort": "+roomCharge",   # VacantHotelSearch の有効なsort値
     }
 
     resp = requests.get(RAKUTEN_VACANT_HOTEL_URL, params=params, timeout=15)
     resp.raise_for_status()
-    data = resp.json()
-
-    hotels_raw = data.get("hotels", [])
-    results = []
-    for hotel_wrap in hotels_raw:
-        # APIレスポンス形式: [{"hotel": [{"hotelBasicInfo":...}, {"roomInfo":...}]}]
-        if isinstance(hotel_wrap, list):
-            hotel_data = hotel_wrap[0] if hotel_wrap else {}
-        elif isinstance(hotel_wrap, dict):
-            hotel_data = hotel_wrap.get("hotel", [{}])[0] if hotel_wrap.get("hotel") else hotel_wrap
-        else:
-            continue
-
-        info = parse_hotel_info(hotel_data)
-        if info:
-            results.append(info)
-
-    return results[:hits]
+    return _parse_hotels_response(resp.json(), hits)
 
 
 def search_hotels_keyword(
@@ -132,7 +165,15 @@ def search_hotels_keyword(
 ) -> list[dict]:
     """
     KeywordHotelSearch API（キーワード検索）でホテルを検索する。
-    日付を問わない場合や、空室APIが失敗した場合のフォールバックとして使用。
+
+    有効なsortパラメータ: +hotelName, -hotelName,
+                          +hotelMinCharge, -hotelMinCharge,
+                          +hotelRoomCount, -hotelRoomCount,
+                          +hotelReviewAverage, -hotelReviewAverage,
+                          +hotelReviewCount, -hotelReviewCount
+
+    ※ datumType は緯度経度指定時のみ有効なパラメータのため送信しない。
+    ※ formatVersion はこのエンドポイントでは受け付けないため送信しない。
     """
     app_id = _get_app_id()
 
@@ -141,30 +182,12 @@ def search_hotels_keyword(
         "keyword": keyword,
         "maxCharge": budget,
         "hits": hits,
-        "sort": "+roomCharge",
-        "datumType": 1,
-        "formatVersion": 2,
+        "sort": "+hotelMinCharge",   # KeywordHotelSearch の有効なsort値
     }
 
     resp = requests.get(RAKUTEN_KEYWORD_HOTEL_URL, params=params, timeout=15)
     resp.raise_for_status()
-    data = resp.json()
-
-    hotels_raw = data.get("hotels", [])
-    results = []
-    for hotel_wrap in hotels_raw:
-        if isinstance(hotel_wrap, list):
-            hotel_data = hotel_wrap[0] if hotel_wrap else {}
-        elif isinstance(hotel_wrap, dict):
-            hotel_data = hotel_wrap.get("hotel", [{}])[0] if hotel_wrap.get("hotel") else hotel_wrap
-        else:
-            continue
-
-        info = parse_hotel_info(hotel_data)
-        if info:
-            results.append(info)
-
-    return results[:hits]
+    return _parse_hotels_response(resp.json(), hits)
 
 
 def search_hotels(
@@ -187,31 +210,31 @@ def search_hotels(
         error_message: エラー発生時のメッセージ、正常時は None
     """
     try:
-        _get_app_id()  # APIキー確認
+        _get_app_id()
     except EnvironmentError as e:
         return [], str(e)
 
-    # 検索キーワードは目的地駅名をそのまま使用
     keyword = destination
 
-    # 1. 空室検索を試みる
+    # 1. 空室検索
     try:
         hotels = search_hotels_vacant(keyword, trip_date, budget)
         if hotels:
             return hotels, None
     except requests.HTTPError as e:
-        print(f"[search_hotel] 空室検索HTTP エラー: {e}")
+        print(f"[search_hotel] 空室検索 HTTP {e.response.status_code}: {e}")
     except requests.RequestException as e:
-        print(f"[search_hotel] 空室検索通信エラー: {e}")
+        print(f"[search_hotel] 空室検索 通信エラー: {e}")
     except Exception as e:
-        print(f"[search_hotel] 空室検索その他エラー: {e}")
+        print(f"[search_hotel] 空室検索 エラー: {e}")
 
     # 2. フォールバック: キーワード検索
     try:
         hotels = search_hotels_keyword(keyword, budget)
         return hotels, None
     except requests.HTTPError as e:
-        msg = f"楽天トラベルAPI エラー: {e}"
+        status = e.response.status_code if e.response is not None else "?"
+        msg = f"楽天トラベルAPI エラー (HTTP {status}): {e}"
         print(f"[search_hotel] {msg}")
         return [], msg
     except requests.RequestException as e:
