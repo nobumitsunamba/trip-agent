@@ -15,8 +15,6 @@ API仕様:
               +hotelNo, -hotelNo, +hotelName, -hotelName, etc.
 
     ※ KeywordHotelSearch/20170426 は存在しないバージョン → 使用禁止
-    ※ datumType は latitude+longitude 指定時のみ有効（keyword単独時に送ると 400）
-
 ジオコーディング:
     Nominatim（OpenStreetMap）を使用。APIキー不要。
     主要新幹線駅は座標辞書からハードコード値を即時返却（高速・安定）。
@@ -31,9 +29,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ---- エンドポイント（バージョン 20131024 が正） ----
-VACANT_HOTEL_URL = "https://app.rakuten.co.jp/services/api/Travel/VacantHotelSearch/20131024"
-SIMPLE_HOTEL_URL = "https://app.rakuten.co.jp/services/api/Travel/SimpleHotelSearch/20131024"
+# ---- エンドポイント ----
+VACANT_HOTEL_URL = "https://app.rakuten.co.jp/services/api/Travel/VacantHotelSearch/20170426"
+SIMPLE_HOTEL_URL = "https://app.rakuten.co.jp/services/api/Travel/SimpleHotelSearch/20170426"
 NOMINATIM_URL    = "https://nominatim.openstreetmap.org/search"
 
 NOMINATIM_UA = "TripAgent/1.0 (business-trip-search; https://github.com/nobumitsunamba/trip-agent)"
@@ -288,10 +286,10 @@ def search_hotels_vacant_geo(
     hits: int = 3,
 ) -> list[dict]:
     """
-    VacantHotelSearch/20131024 で緯度経度 + 日付から空室ホテルを検索する。
+    VacantHotelSearch/20170426 で緯度経度 + 日付から空室ホテルを検索する。
 
-    sort 有効値: +roomCharge, -roomCharge,
-                 +hotelReviewAverage, -hotelReviewAverage
+    ※ datumType は削除（v20170426 では lat/lon と同時に送ると 400 の原因になる場合がある）
+    sort: +roomCharge（安い順）
     """
     checkout = (
         datetime.strptime(trip_date, "%Y-%m-%d") + timedelta(days=1)
@@ -301,15 +299,14 @@ def search_hotels_vacant_geo(
         "applicationId": _get_app_id(),
         "latitude":      round(latitude, 6),
         "longitude":     round(longitude, 6),
-        "datumType":     1,       # 世界測地系 (lat/lon指定時は必須)
-        "searchRadius":  1.0,     # 半径1km
+        "searchRadius":  1.0,           # 半径1km
         "checkinDate":   trip_date,
         "checkoutDate":  checkout,
         "adultNum":      1,
         "roomNum":       1,
         "maxCharge":     budget,
         "hits":          hits,
-        "sort":          "+roomCharge",   # VacantHotelSearch の有効な安い順
+        "sort":          "+roomCharge",  # 安い順
     }
     resp = requests.get(VACANT_HOTEL_URL, params=params, timeout=15)
     resp.raise_for_status()
@@ -323,20 +320,19 @@ def search_hotels_simple_geo(
     hits: int = 3,
 ) -> list[dict]:
     """
-    SimpleHotelSearch/20131024 で緯度経度からホテルを検索する（日付なし）。
+    SimpleHotelSearch/20170426 で緯度経度からホテルを検索する（日付なし）。
 
-    sort 有効値: +hotelMinCharge, -hotelMinCharge,
-                 +hotelReviewAverage, -hotelReviewAverage, etc.
+    ※ datumType は削除（v20170426 では不要、送ると 400 の原因になる場合がある）
+    sort: -roomCharge（指定値）
     """
     params = {
         "applicationId": _get_app_id(),
         "latitude":      round(latitude, 6),
         "longitude":     round(longitude, 6),
-        "datumType":     1,
         "searchRadius":  1.0,
         "maxCharge":     budget,
         "hits":          hits,
-        "sort":          "+hotelMinCharge",   # SimpleHotelSearch の有効な安い順
+        "sort":          "-roomCharge",  # 指定された sort 値
     }
     resp = requests.get(SIMPLE_HOTEL_URL, params=params, timeout=15)
     resp.raise_for_status()

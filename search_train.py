@@ -138,10 +138,12 @@ def _minutes_to_str(minutes: int) -> str:
 
 def _clean_station_name(text: str) -> str:
     """駅名テキストから余分な文字を除去する。"""
-    text = re.sub(r"[　\s]+", "", text)        # 全角・半角スペース除去
-    text = re.sub(r"[発着乗り換え]$", "", text) # 語尾の「発」「着」「乗り換え」
-    text = re.sub(r"\(.*?\)", "", text)        # ()内の注記
-    text = re.sub(r"（.*?）", "", text)        # （）内の注記
+    text = re.sub(r"[　\s]+", " ", text).strip()
+    text = re.sub(r"[発着]$", "", text)         # 語尾「発」「着」
+    text = re.sub(r"乗り換え.*$", "", text)     # 「乗り換えX分」以降
+    text = re.sub(r"\(.*?\)", "", text)          # (…) 注記
+    text = re.sub(r"（.*?）", "", text)          # （…） 注記
+    text = re.sub(r"[\d,]+円.*$", "", text)     # 料金が混入した場合
     return text.strip()
 
 
@@ -159,26 +161,45 @@ def _extract_first_time(text: str) -> str:
     return m.group(1) if m and _is_valid_time(m.group(1)) else ""
 
 
+def _is_train_name_line(text: str) -> bool:
+    """列車名・路線名らしい行かどうかを判定する。"""
+    text = text.strip()
+    if not text or len(text) > 80:
+        return False
+    return bool(
+        re.search(r"\d+号", text)                              # のぞみ123号, はやぶさ5号
+        or "新幹線" in text                                    # 東海道新幹線
+        or re.search(r"JR[\s\w]*線", text)                    # JR神戸線
+        or re.search(r"[ぁ-ん一-鿿]{2,}線", text)     # 山手線, 京浜東北線
+        or re.search(r"特急|急行|快速|各停|普通|準急", text)    # 種別
+        or re.search(r"新快速|特別快速|通勤快速", text)         # 種別詳細
+    )
+
+
+def _is_skip_line(text: str) -> bool:
+    """セグメント抽出でスキップすべき行かどうか。"""
+    text = text.strip()
+    return bool(
+        not text
+        or re.match(r"^[↓→⇒▼▶＞\-ー|｜…]+$", text)    # 矢印・区切り記号のみ
+        or re.match(r"^[\d,]+円$", text)                  # 料金のみ
+        or re.match(r"^\d+分$", text)                     # 分数のみ（乗り換え時間）
+        or re.match(r"^\d+時間(\d+分)?$", text)           # 所要時間のみ
+        or text in {"発", "着", "乗換", "乗り換え"}        # 単独記号
+    )
+
+
+# ---- CSS 構造ベースのパーサー ----
+
 def _extract_segments_from_structure(item: Tag) -> list[dict]:
     """
     CSS クラスベースのパースでセグメントを抽出する。
-
-    Yahoo!乗換案内の典型的な HTML 構造:
-      <ul class="route"> または <ul class="transportResult">
-        <li class="station">  ← 駅
-          <p class="time">07:00</p>
-          <p class="stationName">東京</p>
-        </li>
-        <li class="transport"> ← 交通手段
-          <p class="trainName">のぞみ123号</p>
-          <p class="trainType">東海道新幹線</p>
-        </li>
-        ...
-      </ul>
+    ul ベース（li.station / li.transport）と div ベース（div.station / div.transport）
+    の両方に対応する。
     """
     segments: list[dict] = []
 
-    # 経路詳細 ul を探す（複数のクラス名バリアントに対応）
+    # --- 方式 A: ul 内の li 要素を探す ---
     route_ul = (
         item.select_one("ul.route")
         or item.select_one("ul.transportResult")
@@ -186,105 +207,179 @@ def _extract_segments_from_structure(item: Tag) -> list[dict]:
         or item.select_one("[class*='route'] > ul")
         or item.select_one("[class*='transport'] > ul")
     )
-    if not route_ul:
-        return segments
 
-    for li in route_ul.find_all("li", recursive=False):
-        cls = " ".join(li.get("class", []))
+    candidates = []
+    if route_ul:
+        candidates = route_ul.find_all("li", recursive=False)
 
-        if any(x in cls for x in ("station", "stop", "point")):
+    # --- 方式 B: li が見つからない場合、div コンテナから探す ---
+    if not candidates:
+        route_div = (
+            item.select_one(".routeDetail")
+            or item.select_one(".step")
+            or item.select_one("[class*='detail']")
+        )
+        if route_div:
+            candidates = route_div.find_all(
+                ["div", "section"],
+                recursive=False,
+            )
+
+    for el in candidates:
+        cls = " ".join(el.get("class", []))
+
+        if any(x in cls for x in ("station", "stop", "point", "dep", "arr")):
             # ---- 駅 ----
             time_el = (
-                li.select_one("em.time")
-                or li.select_one(".time")
-                or li.select_one("[class*='time']")
+                el.select_one("em")
+                or el.select_one(".time")
+                or el.select_one("[class*='time']")
             )
             name_el = (
-                li.select_one(".stationName")
-                or li.select_one("[class*='station']")
-                or li.select_one(".name")
-                or li.select_one("p:not([class*='time'])")
+                el.select_one(".stationName")
+                or el.select_one("[class*='stationName']")
+                or el.select_one("[class*='station']:not([class*='time'])")
+                or el.select_one(".name")
             )
             t = _extract_first_time(time_el.get_text() if time_el else "")
             if not t:
-                t = _extract_first_time(li.get_text())
+                t = _extract_first_time(el.get_text())
             n = _clean_station_name(name_el.get_text() if name_el else "")
-            if n and not re.match(r"^\d+$", n):
+            # name_el が取れなかったら全テキストから推定
+            if not n:
+                raw = el.get_text(" ", strip=True)
+                n = _clean_station_name(re.sub(r"\d{1,2}:\d{2}", "", raw))
+            if n and len(n) >= 1 and not re.match(r"^\d+$", n):
                 segments.append({"type": "station", "name": n, "time": t})
 
-        elif any(x in cls for x in ("transport", "train", "line", "section")):
+        elif any(x in cls for x in ("transport", "train", "line", "section", "transit")):
             # ---- 交通手段 ----
             name_el = (
-                li.select_one(".trainName")
-                or li.select_one("[class*='train']")
-                or li.select_one(".lineName")
-                or li.select_one("[class*='line']")
-                or li.select_one("a")
-                or li.select_one(".name")
+                el.select_one(".trainName")
+                or el.select_one("[class*='trainName']")
+                or el.select_one(".lineName")
+                or el.select_one("[class*='line']")
+                or el.select_one("a")
+                or el.select_one(".name")
             )
-            type_el = li.select_one(".trainType, .lineType, [class*='type']")
-
+            type_el = el.select_one(".trainType, .lineType, [class*='type']")
             train_name = (name_el.get_text(strip=True) if name_el else "").strip()
             train_type = (type_el.get_text(strip=True) if type_el else "").strip()
-
-            # 「東海道新幹線 のぞみ123号」のように結合
             if train_type and train_name and train_type not in train_name:
                 display = f"{train_type} {train_name}"
             elif train_name:
                 display = train_name
             else:
-                display = li.get_text(strip=True)
-
-            display = display[:50]  # 長すぎる場合は切り詰め
-            if display:
+                display = el.get_text(" ", strip=True)[:50]
+            if display and not _is_skip_line(display):
                 segments.append({"type": "train", "name": display})
 
     return segments
 
 
-def _extract_segments_from_text(item: Tag) -> list[dict]:
-    """
-    テキストパターンベースのフォールバックパーサー。
+# ---- テキストベースのパーサー（フォールバック）----
 
-    CSS 構造がパースできない場合に、テキスト行を走査して
-    「HH:MM 駅名」形式と「〇〇線・〇〇号」形式を抽出する。
+def _lines_to_segments(lines: list[str]) -> list[dict]:
+    """
+    テキスト行リストからセグメントを抽出する内部ロジック。
+
+    Yahoo!乗換案内のHTMLでは時刻と駅名が別要素になっているため、
+    改行区切りテキストで以下のパターンをすべて処理する:
+
+      (1) 時刻のみ行  → 次の非スキップ行を駅名として取得
+          例: "07:00"
+              "東京"
+      (2) 時刻+駅名 同一行
+          例: "07:00 東京" / "東京 07:00"
+      (3) 列車名行
+          例: "東海道新幹線 のぞみ123号"
     """
     segments: list[dict] = []
-    raw = item.get_text("\n")
-    lines = [l.strip() for l in raw.split("\n") if l.strip()]
+    seen_times: set[str] = set()
 
-    seen_station_times: set[str] = set()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
 
-    for line in lines:
-        # 「07:00 東京」「東京 07:00」形式
-        m = re.match(r"^(\d{1,2}:\d{2})\s+(.+)$", line)
-        if not m:
-            m = re.match(r"^(.+?)\s+(\d{1,2}:\d{2})$", line)
-            if m:
-                m = type("M", (), {"group": lambda self, i: [None, m.group(2), m.group(1)][i]})()
-        if m:
-            t = m.group(1)
-            n = _clean_station_name(m.group(2))
-            if _is_valid_time(t) and n and t not in seen_station_times:
-                seen_station_times.add(t)
-                segments.append({"type": "station", "name": n, "time": t})
+        # ===== (1) 時刻のみの行 "07:00" =====
+        if re.match(r"^\d{1,2}:\d{2}$", line) and _is_valid_time(line):
+            t = line
+            if t in seen_times:
+                i += 1
+                continue
+            seen_times.add(t)
+
+            # 最大 4 行先まで見て駅名を探す
+            name = ""
+            consumed = 0
+            for offset in range(1, 5):
+                if i + offset >= len(lines):
+                    break
+                nxt = lines[i + offset]
+                if _is_skip_line(nxt):
+                    consumed = offset   # スキップ行はカウントするが名前にしない
+                    continue
+                if re.match(r"^\d{1,2}:\d{2}$", nxt) and _is_valid_time(nxt):
+                    break              # 次の時刻が来たら終了
+                if _is_train_name_line(nxt):
+                    break              # 列車名が来たら駅名はなかった
+                candidate = _clean_station_name(nxt)
+                if candidate and len(candidate) >= 1 and not re.match(r"^\d+$", candidate):
+                    name = candidate
+                    consumed = offset
+                    break
+
+            if name:
+                segments.append({"type": "station", "name": name, "time": t})
+                i += consumed + 1
+            else:
+                i += 1
             continue
 
-        # 「のぞみ123号」「東海道新幹線」「JR〇〇線」「〇〇新快速」など
-        if (
-            re.search(r"\d+号", line)
-            or "新幹線" in line
-            or re.search(r"[A-Z]{2}R?\s*\w+線", line)
-            or re.search(r"[\w぀-鿿]+線", line)
-            or "急行" in line
-            or "快速" in line
-            or "特急" in line
-        ):
-            clean = line[:50].strip()
-            if clean and not re.match(r"^\d+$", clean):
-                segments.append({"type": "train", "name": clean})
+        # ===== (2a) 時刻+駅名 同一行 "07:00 東京" =====
+        m = re.match(r"^(\d{1,2}:\d{2})\s+(.+)$", line)
+        if m and _is_valid_time(m.group(1)):
+            t, raw_name = m.group(1), m.group(2)
+            if t not in seen_times:
+                seen_times.add(t)
+                n = _clean_station_name(raw_name)
+                if n:
+                    segments.append({"type": "station", "name": n, "time": t})
+            i += 1
+            continue
+
+        # ===== (2b) 駅名+時刻 同一行 "東京 07:00" =====
+        m = re.match(r"^(.+?)\s+(\d{1,2}:\d{2})$", line)
+        if m and _is_valid_time(m.group(2)):
+            t, raw_name = m.group(2), m.group(1)
+            if t not in seen_times:
+                seen_times.add(t)
+                n = _clean_station_name(raw_name)
+                if n:
+                    segments.append({"type": "station", "name": n, "time": t})
+            i += 1
+            continue
+
+        # ===== (3) 列車名・路線名 =====
+        if _is_train_name_line(line) and not _is_skip_line(line):
+            # 直前が既に列車名なら連結する（「東海道新幹線\nのぞみ123号」対応）
+            if segments and segments[-1]["type"] == "train":
+                prev = segments[-1]["name"]
+                if line not in prev:
+                    segments[-1]["name"] = f"{prev} {line}"[:60]
+            else:
+                segments.append({"type": "train", "name": line[:60]})
+
+        i += 1
 
     return segments
+
+
+def _extract_segments_from_text(item: Tag) -> list[dict]:
+    """Tag オブジェクトからテキストを取り出し _lines_to_segments に渡す。"""
+    raw = item.get_text("\n")
+    lines = [l.strip() for l in raw.split("\n") if l.strip()]
+    return _lines_to_segments(lines)
 
 
 def _extract_segments(item: Tag) -> list[dict]:
