@@ -139,11 +139,14 @@ def _minutes_to_str(minutes: int) -> str:
 def _clean_station_name(text: str) -> str:
     """駅名テキストから余分な文字を除去する。"""
     text = re.sub(r"[　\s]+", " ", text).strip()
-    text = re.sub(r"[発着]$", "", text)         # 語尾「発」「着」
-    text = re.sub(r"乗り換え.*$", "", text)     # 「乗り換えX分」以降
-    text = re.sub(r"\(.*?\)", "", text)          # (…) 注記
-    text = re.sub(r"（.*?）", "", text)          # （…） 注記
-    text = re.sub(r"[\d,]+円.*$", "", text)     # 料金が混入した場合
+    # 先頭の発/着/ー記号を除去（Yahoo Transit UI要素が混入している場合）
+    text = re.sub(r"^[発着ーー\-\s]+", "", text)
+    text = re.sub(r"[発着]$", "", text)          # 語尾「発」「着」
+    text = re.sub(r"乗り換え.*$", "", text)      # 「乗り換えX分」以降
+    text = re.sub(r"\([^)]*\)", "", text)         # (…) 注記（半角括弧）
+    text = re.sub(r"（[^）]*）", "", text)         # （…） 注記（全角括弧・閉じあり）
+    text = re.sub(r"（[^）]*$", "", text)          # （…   注記（閉じ括弧なし）
+    text = re.sub(r"[\d,]+円.*$", "", text)      # 料金が混入した場合
     return text.strip()
 
 
@@ -181,11 +184,23 @@ def _is_skip_line(text: str) -> bool:
     text = text.strip()
     return bool(
         not text
-        or re.match(r"^[↓→⇒▼▶＞\-ー|｜…]+$", text)    # 矢印・区切り記号のみ
-        or re.match(r"^[\d,]+円$", text)                  # 料金のみ
-        or re.match(r"^\d+分$", text)                     # 分数のみ（乗り換え時間）
-        or re.match(r"^\d+時間(\d+分)?$", text)           # 所要時間のみ
-        or text in {"発", "着", "乗換", "乗り換え"}        # 単独記号
+        or re.match(r"^[↓→⇒▼▶＞\-ー|｜…]+$", text)     # 矢印・区切り記号のみ
+        or re.match(r"^[\d,]+円$", text)                   # 料金のみ
+        or re.match(r"^\d+分$", text)                      # 分数のみ（乗り換え時間）
+        or re.match(r"^\d+時間(\d+分)?$", text)            # 所要時間のみ
+        or text in {"発", "着", "乗換", "乗り換え"}         # 単独記号
+        # ---- Yahoo!乗換案内 特有の UI 要素 ----
+        # 「発ー」「着ー」「発 」など：発/着 の後ろが記号・空白のみ
+        or re.match(r"^[発着][ーー\-\s]*$", text)
+        # 「着（乗車1時間28分）」など：発/着 の直後に全角/半角括弧
+        or re.match(r"^[発着][（(]", text)
+        # 「（乗車XX分）」など：括弧始まりのアノテーション
+        or text.startswith("（")
+        or text.startswith("(")
+        # 「3番線」などのホーム番号
+        or re.match(r"^\d+番線", text)
+        # 「乗換X分」など
+        or re.match(r"^乗換\d", text)
     )
 
 
@@ -238,8 +253,10 @@ def _extract_segments_from_structure(item: Tag) -> list[dict]:
             name_el = (
                 el.select_one(".stationName")
                 or el.select_one("[class*='stationName']")
+                or el.select_one(".title")                # Yahoo Transit: .title に駅名
                 or el.select_one("[class*='station']:not([class*='time'])")
                 or el.select_one(".name")
+                or el.select_one("a")                     # 駅名はリンクになっていることが多い
             )
             t = _extract_first_time(time_el.get_text() if time_el else "")
             if not t:
@@ -249,7 +266,7 @@ def _extract_segments_from_structure(item: Tag) -> list[dict]:
             if not n:
                 raw = el.get_text(" ", strip=True)
                 n = _clean_station_name(re.sub(r"\d{1,2}:\d{2}", "", raw))
-            if n and len(n) >= 1 and not re.match(r"^\d+$", n):
+            if n and len(n) >= 1 and not re.match(r"^\d+$", n) and not _is_skip_line(n):
                 segments.append({"type": "station", "name": n, "time": t})
 
         elif any(x in cls for x in ("transport", "train", "line", "section", "transit")):
@@ -258,7 +275,9 @@ def _extract_segments_from_structure(item: Tag) -> list[dict]:
                 el.select_one(".trainName")
                 or el.select_one("[class*='trainName']")
                 or el.select_one(".lineName")
+                or el.select_one(".trainLine")            # Yahoo Transit: .trainLine
                 or el.select_one("[class*='line']")
+                or el.select_one("p")                     # 列車名は <p> に入ることが多い
                 or el.select_one("a")
                 or el.select_one(".name")
             )
@@ -324,7 +343,10 @@ def _lines_to_segments(lines: list[str]) -> list[dict]:
                 if _is_train_name_line(nxt):
                     break              # 列車名が来たら駅名はなかった
                 candidate = _clean_station_name(nxt)
-                if candidate and len(candidate) >= 1 and not re.match(r"^\d+$", candidate):
+                if (candidate
+                        and len(candidate) >= 1
+                        and not re.match(r"^\d+$", candidate)
+                        and not _is_skip_line(candidate)):
                     name = candidate
                     consumed = offset
                     break
@@ -397,8 +419,10 @@ def _extract_segments(item: Tag) -> list[dict]:
     # アプローチ1: CSS クラス構造ベース
     segments = _extract_segments_from_structure(item)
 
-    # アプローチ2: テキストパターンベース（構造パースが不十分な場合）
-    if len(segments) < 2:
+    # アプローチ2: テキストパターンベース（フォールバック）
+    # 条件: セグメント2件未満、または列車情報がない（駅だけでは不完全）
+    has_train = any(s.get("type") == "train" for s in segments)
+    if len(segments) < 2 or not has_train:
         segments = _extract_segments_from_text(item)
 
     # 重複除去: 連続する同じ要素は1つにまとめる

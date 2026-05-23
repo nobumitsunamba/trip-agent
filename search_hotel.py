@@ -3,18 +3,20 @@ search_hotel.py
 楽天トラベルAPIを使ってホテルを検索するモジュール（緯度経度ベース）
 
 API仕様:
-    VacantHotelSearch/20131024
+    VacantHotelSearch/20170426
         https://webservice.rakuten.co.jp/documentation/vacant-hotel-search
-        必須: applicationId, checkinDate, checkoutDate + (keyword OR latitude+longitude+datumType)
+        必須: applicationId, checkinDate, checkoutDate + (latitude+longitude)
         sort: +roomCharge, -roomCharge, +hotelReviewAverage, -hotelReviewAverage
+        ※ roomCharge は実際の空室料金。日付あり検索専用。
 
-    SimpleHotelSearch/20131024
+    SimpleHotelSearch/20170426
         https://webservice.rakuten.co.jp/documentation/simple-hotel-search
-        必須: applicationId + (keyword OR latitude+longitude+datumType)
+        必須: applicationId + (latitude+longitude)
         sort: +hotelMinCharge, -hotelMinCharge, +hotelReviewAverage, -hotelReviewAverage,
-              +hotelNo, -hotelNo, +hotelName, -hotelName, etc.
+              +hotelNo, -hotelNo, +hotelName, -hotelName, standard
+        ※ roomCharge は VacantHotelSearch 専用。SimpleHotelSearch で使うと 400 エラー。
 
-    ※ KeywordHotelSearch/20170426 は存在しないバージョン → 使用禁止
+    ※ datumType パラメータは v20170426 では不要（送ると 400 エラーの原因になる）
 ジオコーディング:
     Nominatim（OpenStreetMap）を使用。APIキー不要。
     主要新幹線駅は座標辞書からハードコード値を即時返却（高速・安定）。
@@ -323,7 +325,8 @@ def search_hotels_simple_geo(
     SimpleHotelSearch/20170426 で緯度経度からホテルを検索する（日付なし）。
 
     ※ datumType は削除（v20170426 では不要、送ると 400 の原因になる場合がある）
-    sort: -roomCharge（指定値）
+    sort: +hotelMinCharge（安い順）
+        ※ roomCharge は VacantHotelSearch 専用。SimpleHotelSearch で使うと 400 エラー。
     """
     params = {
         "applicationId": _get_app_id(),
@@ -332,7 +335,7 @@ def search_hotels_simple_geo(
         "searchRadius":  1.0,
         "maxCharge":     budget,
         "hits":          hits,
-        "sort":          "-roomCharge",  # 指定された sort 値
+        "sort":          "+hotelMinCharge",  # SimpleHotelSearch は hotelMinCharge を使用
     }
     resp = requests.get(SIMPLE_HOTEL_URL, params=params, timeout=15)
     resp.raise_for_status()
