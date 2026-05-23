@@ -370,6 +370,50 @@ def search_hotels_keyword(
     return _parse_hotels_response(resp.json(), hits)
 
 
+def _extract_api_error(e: "requests.HTTPError") -> str:
+    """
+    requests.HTTPError から Rakuten API のエラー詳細を取り出す。
+
+    Rakuten API は 400/401 時に次の形式の JSON を返す:
+        {"error": "wrong_parameter", "error_description": "..."}
+    これを読み取り、人間が読みやすい形式で返す。
+    """
+    resp = getattr(e, "response", None)
+    if resp is None:
+        return str(e)
+
+    status = resp.status_code
+    # JSON エラー詳細を取り出す
+    api_err = ""
+    api_desc = ""
+    try:
+        body = resp.json()
+        api_err  = body.get("error", "")
+        api_desc = body.get("error_description", "")
+    except Exception:
+        pass
+
+    # ステータスコード別メッセージ
+    if status == 400:
+        detail = f"{api_err}: {api_desc}" if api_err else resp.text[:200]
+        return (
+            f"HTTP 400 Bad Request — パラメータエラー\n"
+            f"詳細: {detail}\n"
+            f"リクエストURL: {resp.url}"
+        )
+    elif status == 401:
+        return (
+            f"HTTP 401 Unauthorized — APIキー認証失敗\n"
+            f".env の RAKUTEN_APP_ID を確認してください。\n"
+            f"詳細: {api_desc or resp.text[:200]}"
+        )
+    elif status == 429:
+        return "HTTP 429 Too Many Requests — API リクエスト上限に達しました。しばらく待ってから再試行してください。"
+    else:
+        detail = api_desc or resp.text[:200]
+        return f"HTTP {status} — {detail}"
+
+
 def search_hotels(
     destination: str,
     trip_date: str,
@@ -402,8 +446,7 @@ def search_hotels(
             if hotels:
                 return hotels, None
         except requests.HTTPError as e:
-            status = e.response.status_code if e.response is not None else "?"
-            print(f"[search_hotel] VacantHotelSearch HTTP {status}: {e}")
+            print(f"[search_hotel] VacantHotelSearch: {_extract_api_error(e)}")
         except Exception as e:
             print(f"[search_hotel] VacantHotelSearch エラー: {e}")
 
@@ -413,8 +456,7 @@ def search_hotels(
             if hotels:
                 return hotels, None
         except requests.HTTPError as e:
-            status = e.response.status_code if e.response is not None else "?"
-            print(f"[search_hotel] SimpleHotelSearch(geo) HTTP {status}: {e}")
+            print(f"[search_hotel] SimpleHotelSearch(geo): {_extract_api_error(e)}")
         except Exception as e:
             print(f"[search_hotel] SimpleHotelSearch(geo) エラー: {e}")
 
@@ -426,9 +468,10 @@ def search_hotels(
             return hotels, None
         return [], f"「{destination}」周辺のホテルが見つかりませんでした（予算: ¥{budget:,}円以下）。"
     except requests.HTTPError as e:
-        status = e.response.status_code if e.response is not None else "?"
-        msg = f"楽天トラベルAPI エラー (HTTP {status})\nURLを確認して .env の RAKUTEN_APP_ID を設定してください。"
-        print(f"[search_hotel] keyword HTTP {status}: {e}")
+        detail = _extract_api_error(e)
+        print(f"[search_hotel] keyword: {detail}")
+        # GUI に表示するメッセージ（実際のエラー詳細を含める）
+        msg = f"楽天トラベルAPI エラー\n{detail}"
         return [], msg
     except Exception as e:
         msg = f"ホテル検索エラー: {e}"
