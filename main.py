@@ -186,12 +186,19 @@ class TripAgentApp(tk.Tk):
         self._results_frame.columnconfigure(1, weight=1)
 
         # 左：新幹線結果
-        self._train_frame = self._make_section(self._results_frame, "🚄  新幹線候補", 0)
+        self._train_frame, self._train_canvas = self._make_section(
+            self._results_frame, "🚄  新幹線候補", 0
+        )
         # 右：ホテル結果
-        self._hotel_frame = self._make_section(self._results_frame, "🏨  ホテル候補", 1)
+        self._hotel_frame, self._hotel_canvas = self._make_section(
+            self._results_frame, "🏨  ホテル候補", 1
+        )
 
         self._show_placeholder(self._train_frame, "「検索する」ボタンを押してください")
         self._show_placeholder(self._hotel_frame, "「検索する」ボタンを押してください")
+
+        # マウスホイール スクロール設定
+        self._setup_scroll()
 
     def _build_input_frame(self, parent):
         frame = tk.LabelFrame(
@@ -237,8 +244,8 @@ class TripAgentApp(tk.Tk):
             bg=BTN_PRIMARY, padx=20, pady=10, font=FONT_BOLD,
         ).pack(fill="y", expand=True)
 
-    def _make_section(self, parent, title: str, col: int) -> tk.Frame:
-        """タイトル付きのセクションフレームを作成して返す。"""
+    def _make_section(self, parent, title: str, col: int) -> tuple:
+        """タイトル付きのスクロール可能なセクションを作成し (content_frame, canvas) を返す。"""
         outer = tk.Frame(parent, bg=APP_BG)
         outer.grid(row=0, column=col, sticky="nsew", padx=(0, 6) if col == 0 else (6, 0))
         outer.rowconfigure(1, weight=1)
@@ -249,10 +256,34 @@ class TripAgentApp(tk.Tk):
             bg=APP_BG, fg=LABEL_FG, anchor="w",
         ).grid(row=0, column=0, sticky="w", pady=(8, 4))
 
-        content = tk.Frame(outer, bg=APP_BG)
-        content.grid(row=1, column=0, sticky="nsew")
+        # Canvas + Scrollbar でスクロール可能なエリアを構成
+        scroll_area = tk.Frame(outer, bg=APP_BG)
+        scroll_area.grid(row=1, column=0, sticky="nsew")
+        scroll_area.rowconfigure(0, weight=1)
+        scroll_area.columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(scroll_area, bg=APP_BG, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(scroll_area, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        content = tk.Frame(canvas, bg=APP_BG)
         content.columnconfigure(0, weight=1)
-        return content
+
+        window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def _on_content_configure(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfig(window_id, width=event.width)
+
+        content.bind("<Configure>", _on_content_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        return content, canvas
 
     def _show_placeholder(self, frame: tk.Frame, msg: str):
         for w in frame.winfo_children():
@@ -271,6 +302,47 @@ class TripAgentApp(tk.Tk):
         bar.pack(pady=4)
         bar.start(10)
         return bar
+
+    def _setup_scroll(self) -> None:
+        """
+        マウスホイールで左右のスクロール可能エリアをスクロールする。
+        カーソル位置（root座標）からどちらのキャンバスを対象にするか判定する。
+        """
+        def _pick_canvas(x_root: int, y_root: int) -> "tk.Canvas | None":
+            for canvas in (self._train_canvas, self._hotel_canvas):
+                try:
+                    cx = canvas.winfo_rootx()
+                    cy = canvas.winfo_rooty()
+                    cw = canvas.winfo_width()
+                    ch = canvas.winfo_height()
+                    if cx <= x_root <= cx + cw and cy <= y_root <= cy + ch:
+                        return canvas
+                except Exception:
+                    pass
+            return None
+
+        def _on_mousewheel(event):          # Windows / macOS
+            canvas = _pick_canvas(event.x_root, event.y_root)
+            if canvas:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _on_btn4(event):               # Linux スクロールアップ
+            canvas = _pick_canvas(event.x_root, event.y_root)
+            if canvas:
+                canvas.yview_scroll(-1, "units")
+
+        def _on_btn5(event):               # Linux スクロールダウン
+            canvas = _pick_canvas(event.x_root, event.y_root)
+            if canvas:
+                canvas.yview_scroll(1, "units")
+
+        self.bind_all("<MouseWheel>", _on_mousewheel)
+        self.bind_all("<Button-4>",   _on_btn4)
+        self.bind_all("<Button-5>",   _on_btn5)
+
+    def _reset_scroll(self, canvas: tk.Canvas) -> None:
+        """スクロール位置をトップにリセットする。"""
+        canvas.yview_moveto(0)
 
     # ----------------------------------------------------------
     # 検索ロジック
@@ -353,6 +425,7 @@ class TripAgentApp(tk.Tk):
 
         if not self._train_results:
             self._show_placeholder(self._train_frame, "新幹線の検索結果がありませんでした")
+            self._reset_scroll(self._train_canvas)
             return
 
         for i, route in enumerate(self._train_results):
@@ -366,6 +439,8 @@ class TripAgentApp(tk.Tk):
                 lambda url=self._yahoo_url: webbrowser.open(url),
                 bg=BTN_YAHOO, padx=10, pady=6,
             ).pack(fill="x", padx=4, pady=(6, 0))
+
+        self._reset_scroll(self._train_canvas)
 
     def _build_train_card(self, parent: tk.Frame, route: dict, index: int):
         card = tk.Frame(
@@ -591,6 +666,8 @@ class TripAgentApp(tk.Tk):
             text="※ ボタンをクリックするとブラウザで検索結果が開きます",
             font=FONT_SMALL, fg=MUTED_FG, bg=APP_BG,
         ).pack(anchor="w", padx=8, pady=(2, 0))
+
+        self._reset_scroll(self._hotel_canvas)
 
 
 # ============================================================
