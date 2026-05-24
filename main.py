@@ -20,6 +20,12 @@ from tkinter import messagebox, ttk
 from search_hotel import build_hotel_search_urls
 from search_train import search_trains
 
+try:
+    from tkcalendar import DateEntry as _DateEntry
+    _HAS_CALENDAR = True
+except ImportError:
+    _HAS_CALENDAR = False
+
 # ============================================================
 # 定数・設定
 # ============================================================
@@ -179,9 +185,10 @@ class TripAgentApp(tk.Tk):
         # 入力フォーム
         self._build_input_frame(outer)
 
-        # 結果エリア（左右分割）
+        # 結果エリア（左右分割・縦方向フル展開）
         self._results_frame = tk.Frame(outer, bg=APP_BG)
         self._results_frame.pack(fill="both", expand=True, pady=(10, 0))
+        self._results_frame.rowconfigure(0, weight=1)       # ← 縦方向に伸ばす
         self._results_frame.columnconfigure(0, weight=1)
         self._results_frame.columnconfigure(1, weight=1)
 
@@ -210,30 +217,63 @@ class TripAgentApp(tk.Tk):
 
         # 入力変数
         li = self._last_input
-        self.var_from = tk.StringVar(value=li.get("from_station", ""))
-        self.var_to = tk.StringVar(value=li.get("to_station", ""))
-        self.var_arr = tk.StringVar(value=li.get("arrival_time", ""))
-        self.var_date = tk.StringVar(value=li.get("trip_date", ""))
+        self.var_from   = tk.StringVar(value=li.get("from_station", ""))
+        self.var_to     = tk.StringVar(value=li.get("to_station", ""))
+        self.var_arr    = tk.StringVar(value=li.get("arrival_time", ""))
         self.var_budget = tk.StringVar(value=str(li.get("hotel_budget", 15000)))
+        # var_date は DateEntry がある場合は補助的に使う
+        self.var_date   = tk.StringVar(value=li.get("trip_date", ""))
 
+        # フィールド定義: (ラベル, 種別, StringVar or None)
+        # 種別: "entry" = 通常テキスト, "date" = カレンダーピッカー
+        # ※ 順序: 出発地 / 目的地 / 出張日 / 希望着時刻 / 予算
         fields = [
-            ("出発地（最寄り駅）", self.var_from, "例：東京"),
-            ("目的地（最寄り駅）", self.var_to, "例：名古屋"),
-            ("希望着時刻 (HH:MM)", self.var_arr, "例：10:00"),
-            ("出張日 (YYYY-MM-DD)", self.var_date, "例：2026-06-15"),
-            ("ホテル予算上限 (円/泊)", self.var_budget, "例：15000"),
+            ("出発地（最寄り駅）",    "entry", self.var_from),
+            ("目的地（最寄り駅）",    "entry", self.var_to),
+            ("出張日",               "date",  self.var_date),
+            ("希望着時刻 (HH:MM)",   "entry", self.var_arr),
+            ("ホテル予算上限 (円/泊)", "entry", self.var_budget),
         ]
 
-        for col_offset, (label, var, placeholder) in enumerate(fields):
+        self._date_entry_widget = None   # DateEntry ウィジェット参照
+
+        for col_offset, (label, kind, var) in enumerate(fields):
             col = col_offset * 2
+            px = (6 if col > 0 else 0, 2)
             tk.Label(frame, text=label, font=FONT_SMALL, fg=MUTED_FG, bg=SECTION_BG).grid(
-                row=0, column=col, sticky="w", padx=(6 if col > 0 else 0, 2), pady=(0, 2)
+                row=0, column=col, sticky="w", padx=px, pady=(0, 2)
             )
-            entry = tk.Entry(
-                frame, textvariable=var, font=FONT_BASE,
-                width=16, relief="solid", bd=1,
-            )
-            entry.grid(row=1, column=col, sticky="ew", padx=(6 if col > 0 else 0, 4), pady=2)
+            if kind == "date" and _HAS_CALENDAR:
+                # カレンダーピッカー
+                from datetime import datetime as _dt
+                de = _DateEntry(
+                    frame,
+                    font=FONT_BASE,
+                    width=14,
+                    date_pattern="yyyy-mm-dd",
+                    locale="ja_JP",
+                    relief="solid",
+                    borderwidth=1,
+                    background=BTN_PRIMARY,
+                    foreground=BTN_FG,
+                    selectbackground=BTN_PRIMARY,
+                )
+                # 保存済み日付をセット
+                saved = li.get("trip_date", "")
+                if saved:
+                    try:
+                        de.set_date(_dt.strptime(saved, "%Y-%m-%d"))
+                    except Exception:
+                        pass
+                de.grid(row=1, column=col, sticky="ew", padx=(6 if col > 0 else 0, 4), pady=2)
+                self._date_entry_widget = de
+            else:
+                # 通常テキスト入力（tkcalendar 未インストール時の出張日フォールバックも含む）
+                entry = tk.Entry(
+                    frame, textvariable=var, font=FONT_BASE,
+                    width=16, relief="solid", bd=1,
+                )
+                entry.grid(row=1, column=col, sticky="ew", padx=(6 if col > 0 else 0, 4), pady=2)
             frame.columnconfigure(col, weight=1)
 
         # 検索ボタン
@@ -353,7 +393,14 @@ class TripAgentApp(tk.Tk):
         from_st = self.var_from.get().strip()
         to_st = self.var_to.get().strip()
         arr_time = self.var_arr.get().strip()
-        trip_date = self.var_date.get().strip()
+        # DateEntry がある場合はそこから取得（YYYY-MM-DD）
+        if self._date_entry_widget is not None:
+            try:
+                trip_date = self._date_entry_widget.get_date().strftime("%Y-%m-%d")
+            except Exception:
+                trip_date = self.var_date.get().strip()
+        else:
+            trip_date = self.var_date.get().strip()
         budget_str = self.var_budget.get().strip()
 
         # 入力バリデーション
@@ -469,23 +516,24 @@ class TripAgentApp(tk.Tk):
         ).grid(row=row, column=1, columnspan=3, sticky="w", padx=4, pady=(6, 2))
         row += 1
 
-        # ---- トータル: 出発・到着・所要時間・料金 ----
+        # ---- トータル: 2行レイアウト（出発・到着 / 所要・料金）----
         info_frame = tk.Frame(card, bg=CARD_BG)
         info_frame.grid(row=row, column=1, columnspan=3, sticky="w", padx=4, pady=(0, 4))
         row += 1
 
-        for col, (lbl, val) in enumerate([
-            ("🕐 出発", route.get("dep_time", "—")),
-            ("🏁 到着", route.get("arr_time", "—")),
-            ("⏱ 所要", route.get("duration", "—")),
-            ("💴 料金", route.get("fare", "—")),
+        for r_idx, row_items in enumerate([
+            [("🕐 出発", route.get("dep_time", "—")),
+             ("🏁 到着", route.get("arr_time", "—"))],
+            [("⏱ 所要", route.get("duration", "—")),
+             ("💴 料金", route.get("fare", "—"))],
         ]):
-            tk.Label(info_frame, text=lbl, font=FONT_SMALL, fg=MUTED_FG, bg=CARD_BG).grid(
-                row=0, column=col * 2, padx=(8 if col > 0 else 0, 2)
-            )
-            tk.Label(info_frame, text=val, font=FONT_BOLD, fg=LABEL_FG, bg=CARD_BG).grid(
-                row=0, column=col * 2 + 1, padx=(0, 12)
-            )
+            for c_idx, (lbl, val) in enumerate(row_items):
+                tk.Label(info_frame, text=lbl, font=FONT_SMALL, fg=MUTED_FG, bg=CARD_BG).grid(
+                    row=r_idx, column=c_idx * 2, padx=(12 if c_idx > 0 else 0, 2), pady=1
+                )
+                tk.Label(info_frame, text=val, font=FONT_BOLD, fg=LABEL_FG, bg=CARD_BG).grid(
+                    row=r_idx, column=c_idx * 2 + 1, padx=(0, 16), pady=1
+                )
 
         # ---- 経路詳細セクション ----
         segments = route.get("segments", [])
