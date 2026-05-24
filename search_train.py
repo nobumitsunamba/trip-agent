@@ -30,8 +30,20 @@ from bs4 import BeautifulSoup, Tag
 # TRANSIT_DEBUG=1 を設定するとセグメント抽出のデバッグ情報を stdout に出力する
 _TRANSIT_DEBUG = os.getenv("TRANSIT_DEBUG", "").lower() in ("1", "true", "yes")
 
-YAHOO_TRANSIT_BASE = "https://transit.yahoo.co.jp/search/result"
-YAHOO_TRANSIT_TOP  = "https://transit.yahoo.co.jp/"
+YAHOO_TRANSIT_BASE  = "https://transit.yahoo.co.jp/search/result"
+YAHOO_TRANSIT_PRINT = "https://transit.yahoo.co.jp/search/print"
+YAHOO_TRANSIT_TOP   = "https://transit.yahoo.co.jp/"
+
+_SHINKANSEN_RE = re.compile(
+    r"新幹線|のぞみ|ひかり|こだま|はやぶさ|はやて|こまち|つばさ|やまびこ|なすの|"
+    r"とき|たにがわ|かがやき|はくたか|つるぎ|さくら|みずほ|つばめ|かもめ"
+)
+
+
+def _is_shinkansen(name: str) -> bool:
+    """列車名・路線名が新幹線かどうかを判定する。"""
+    return bool(_SHINKANSEN_RE.search(name))
+
 
 # 東北・北海道・上越・北陸方面（えきねっと対象路線判定）
 EKINET_KEYWORDS = [
@@ -94,6 +106,31 @@ def build_yahoo_url(from_station: str, to_station: str, arrival_time: str, trip_
         "sr": "1",
     }
     return YAHOO_TRANSIT_BASE + "?" + urllib.parse.urlencode(params, encoding="utf-8")
+
+
+def build_yahoo_print_url(from_station: str, to_station: str, arrival_time: str, trip_date: str) -> str:
+    """Yahoo!乗換案内の印刷用URLを生成する（ステップ詳細を含む静的HTMLページ）。"""
+    dt = datetime.strptime(trip_date, "%Y-%m-%d")
+    hh, mm = arrival_time.split(":")
+    params = {
+        "from": from_station,
+        "to": to_station,
+        "y": dt.strftime("%Y"),
+        "m": dt.strftime("%m"),
+        "d": dt.strftime("%d"),
+        "hh": hh,
+        "m1": mm[0],
+        "m2": mm[1] if len(mm) >= 2 else "0",
+        "type": "4",
+        "ticket": "ic",
+        "expkind": "1",
+        "shin": "1",
+        "ex": "1",
+        "hb": "1",
+        "lb": "1",
+        "sr": "1",
+    }
+    return YAHOO_TRANSIT_PRINT + "?" + urllib.parse.urlencode(params, encoding="utf-8")
 
 
 def determine_booking_site(from_station: str, to_station: str, route_text: str = "") -> dict:
@@ -497,6 +534,150 @@ def _extract_segments(item: Tag) -> list[dict]:
     return deduped
 
 
+def _parse_step_list(container: Tag) -> list[dict]:
+    """
+    ul/div コンテナからステーション・交通手段セグメントを抽出する。
+    Yahoo!乗換案内の印刷ページ向け。
+    """
+    segments: list[dict] = []
+    items = container.find_all(["li", "div", "section"], recursive=False)
+
+    for item in items:
+        cls = " ".join(item.get("class", []))
+
+        is_station  = any(x in cls for x in ("station", "stop", "departure", "arrival", "point"))
+        is_transport = any(x in cls for x in ("transport", "train", "transit", "line", "section"))
+
+        # クラス判定できない場合はコンテンツで判定
+        if not is_station and not is_transport:
+            text = item.get_text(" ", strip=True)
+            if re.search(r"\d{1,2}:\d{2}", text) and len(text) < 60:
+                is_station = True
+            elif _is_train_name_line(text) and not _is_skip_line(text):
+                is_transport = True
+
+        if is_station:
+            time_el = (
+                item.select_one("em")
+                or item.select_one(".time")
+                or item.select_one("[class*='time']")
+            )
+            name_el = (
+                item.select_one(".stationName")
+                or item.select_one("[class*='stationName']")
+                or item.select_one(".title")
+                or item.select_one("a")
+                or item.select_one("strong")
+            )
+            t = _extract_first_time(time_el.get_text() if time_el else "")
+            if not t:
+                t = _extract_first_time(item.get_text())
+            n = _clean_station_name(name_el.get_text() if name_el else "")
+            if not n:
+                raw = item.get_text(" ", strip=True)
+                n = _clean_station_name(re.sub(r"\d{1,2}:\d{2}", "", raw))
+            if n and len(n) >= 1 and not re.match(r"^\d+$", n) and not _is_skip_line(n):
+                segments.append({"type": "station", "name": n, "time": t})
+
+        elif is_transport:
+            # 路線名 + 列車名を別々に取得して結合する
+            line_el = (
+                item.select_one(".trainLine")
+                or item.select_one("[class*='trainLine']")
+                or item.select_one(".lineName")
+            )
+            name_el = (
+                item.select_one(".trainName")
+                or item.select_one("[class*='trainName']")
+            )
+            line_text = (line_el.get_text(strip=True) if line_el else "").strip()
+            name_text = (name_el.get_text(strip=True) if name_el else "").strip()
+
+            if line_text and name_text:
+                train_name = f"{line_text} {name_text}"
+            elif line_text or name_text:
+                train_name = line_text or name_text
+            else:
+                # フォールバック: p / a / strong / テキスト全体
+                fallback_el = (
+                    item.select_one("p")
+                    or item.select_one("a")
+                    or item.select_one("strong")
+                )
+                train_name = (fallback_el.get_text(strip=True) if fallback_el else "").strip()
+                if not train_name:
+                    train_name = item.get_text(" ", strip=True)[:60]
+
+            # 所要時間の注記を除去
+            train_name = re.sub(r"[（(]\s*\d+時間\d*分?\s*[）)]", "", train_name)
+            train_name = re.sub(r"[（(]\s*\d+分\s*[）)]", "", train_name).strip()
+            if train_name and not _is_skip_line(train_name):
+                segments.append({
+                    "type":         "train",
+                    "name":         train_name[:60],
+                    "is_shinkansen": _is_shinkansen(train_name),
+                })
+
+    return segments
+
+
+def _parse_print_page(soup: BeautifulSoup, from_station: str, to_station: str) -> list[list[dict]]:
+    """
+    Yahoo!乗換案内の印刷ページから各経路のセグメントリストを抽出する。
+
+    Returns:
+        list of segment lists, 最大3件（各ルートの詳細）
+    """
+    all_route_segments: list[list[dict]] = []
+
+    # ルートコンテナを探す
+    route_containers: list[Tag] = (
+        soup.select("section.routeWrap")
+        or soup.select("li.routeWrap")
+        or soup.select("div.routeWrap")
+        or soup.select(".routeResult > section")
+        or soup.select(".routeResult > div[class]")
+        or soup.select("#routeList > li")
+        or []
+    )
+
+    if route_containers:
+        for container in route_containers[:3]:
+            step_list = (
+                container.select_one("ul.step")
+                or container.select_one("ol.step")
+                or container.select_one("ul.route")
+                or container.select_one("[class*='step'] > ul")
+                or container.select_one("ul")
+            )
+            segs: list[dict] = []
+            if step_list:
+                segs = _parse_step_list(step_list)
+            if not segs:
+                segs = _parse_step_list(container)
+            if len(segs) >= 3 and any(s["type"] == "train" for s in segs):
+                all_route_segments.append(segs)
+    else:
+        # ルートコンテナが見つからない: ページ全体からステップリストを探す
+        step_lists: list[Tag] = (
+            soup.select("ul.step")
+            or soup.select("ol.step")
+            or soup.select("ul.route")
+            or []
+        )
+        for sl in step_lists[:3]:
+            segs = _parse_step_list(sl)
+            if len(segs) >= 3 and any(s["type"] == "train" for s in segs):
+                all_route_segments.append(segs)
+
+    if _TRANSIT_DEBUG:
+        print(f"[TRANSIT_DEBUG] _parse_print_page: {len(all_route_segments)} routes found")
+        for ri, segs in enumerate(all_route_segments):
+            print(f"  route {ri}: {segs}")
+
+    return all_route_segments
+
+
 def _extract_text_trains(lines: list[str]) -> list[str]:
     """
     テキスト行から列車名・路線名を順番に抽出する（HTML構造非依存）。
@@ -652,6 +833,11 @@ def _parse_single_route(
         segments = fb
         seg_has_train = True
 
+    # ---- is_shinkansen フラグを train セグメントに付与 ----
+    for seg in segments:
+        if seg["type"] == "train" and "is_shinkansen" not in seg:
+            seg["is_shinkansen"] = _is_shinkansen(seg["name"])
+
     # ---- 路線サマリー ----
     # segments から列車名 → なければ text_trains → なければ「出発→到着」
     route_summary = _build_route_summary(segments)
@@ -784,11 +970,59 @@ def search_trains(
     try:
         session = _make_session()
         session.headers["Referer"] = YAHOO_TRANSIT_TOP
+
+        # 1. メインURL → ルートサマリー（出発・到着・所要時間・料金）を取得
         resp = session.get(yahoo_url, timeout=15)
         resp.raise_for_status()
         resp.encoding = resp.apparent_encoding or "utf-8"
         soup = BeautifulSoup(resp.text, "lxml")
         routes = parse_routes(soup, from_station, to_station)
+
+        # 2. 印刷URL → ステップ詳細（列車名・乗り換え駅・時刻）を取得
+        #    セグメントが不完全（列車名なし or 「詳細は」プレースホルダ）な場合に試みる
+        def _needs_detail(r: dict) -> bool:
+            segs = r.get("segments", [])
+            trains = [s for s in segs if s["type"] == "train"]
+            if not trains:
+                return True
+            placeholder_kw = ("詳細は", "直通（", "乗換")
+            return any(any(kw in s.get("name", "") for kw in placeholder_kw) for s in trains)
+
+        if any(_needs_detail(r) for r in routes):
+            try:
+                print_url = build_yahoo_print_url(from_station, to_station, arrival_time, trip_date)
+                session.headers["Referer"] = yahoo_url
+                resp2 = session.get(print_url, timeout=15)
+                resp2.raise_for_status()
+                resp2.encoding = resp2.apparent_encoding or "utf-8"
+                soup2 = BeautifulSoup(resp2.text, "lxml")
+                print_route_segs = _parse_print_page(soup2, from_station, to_station)
+
+                # インデックスでルートとステップ詳細を対応付けてマージ
+                for i, route in enumerate(routes):
+                    if i < len(print_route_segs):
+                        candidate = print_route_segs[i]
+                        # 有効なセグメント（駅2件以上 + 列車1件以上）があれば置き換え
+                        has_train   = any(s["type"] == "train"   for s in candidate)
+                        has_station = sum(1 for s in candidate if s["type"] == "station") >= 2
+                        if has_train and has_station:
+                            # dep_time / arr_time を補完
+                            stations = [s for s in candidate if s["type"] == "station"]
+                            if stations and not stations[0].get("time") and route.get("dep_time", "—") != "—":
+                                stations[0]["time"] = route["dep_time"]
+                            if len(stations) >= 2 and not stations[-1].get("time") and route.get("arr_time", "—") != "—":
+                                stations[-1]["time"] = route["arr_time"]
+                            # is_shinkansen フラグを付与
+                            for seg in candidate:
+                                if seg["type"] == "train" and "is_shinkansen" not in seg:
+                                    seg["is_shinkansen"] = _is_shinkansen(seg["name"])
+                            route["segments"] = candidate
+                            # 路線サマリーも更新
+                            route["route_summary"] = _build_route_summary(candidate) or route["route_summary"]
+
+            except Exception as e:
+                print(f"[search_train] 印刷URL取得・パースエラー: {e}")
+
     except requests.HTTPError as e:
         print(f"[search_train] HTTP エラー ({e.response.status_code}): {e}")
     except requests.RequestException as e:

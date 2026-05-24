@@ -86,6 +86,16 @@ def save_last_input(data: dict) -> None:
 # ウィジェットヘルパー
 # ============================================================
 
+def _is_shinkansen_train(name: str) -> bool:
+    """列車名・路線名が新幹線かどうかを判定する（表示用）。"""
+    import re
+    return bool(re.search(
+        r"新幹線|のぞみ|ひかり|こだま|はやぶさ|はやて|こまち|つばさ|やまびこ|なすの|"
+        r"とき|たにがわ|かがやき|はくたか|つるぎ|さくら|みずほ|つばめ|かもめ",
+        name,
+    ))
+
+
 def make_button(parent, text, command, bg=BTN_PRIMARY, fg=BTN_FG, font=None, padx=14, pady=6) -> tk.Button:
     font = font or FONT_BASE
     btn = tk.Button(
@@ -367,13 +377,12 @@ class TripAgentApp(tk.Tk):
         card.columnconfigure(1, weight=1)
 
         # ---- カード左：番号バッジ ----
-        badge_rows = 6  # セグメントがある場合でも十分な行数
         tk.Label(
             card, text=f" {index} ",
             font=(FONT_BASE[0], 13, "bold"),
             bg=BTN_TRAIN_BOOK, fg=BTN_FG,
             width=3,
-        ).grid(row=0, column=0, rowspan=badge_rows, sticky="ns", padx=(0, 8))
+        ).grid(row=0, column=0, rowspan=20, sticky="ns", padx=(0, 8))
 
         row = 0
 
@@ -415,38 +424,8 @@ class TripAgentApp(tk.Tk):
             detail_frame.grid(row=row, column=1, columnspan=3, sticky="w", padx=8, pady=(0, 4))
             row += 1
 
-            for seg in segments:
-                if seg["type"] == "station":
-                    # 駅行: 「🚉 07:00  東京」
-                    t    = seg.get("time", "")
-                    name = seg.get("name", "")
-                    time_str = f"{t}  " if t else ""
-                    # 乗り換え駅（先頭・末尾以外）は色を変える
-                    is_endpoint = (
-                        seg is segments[0]
-                        or seg is next((s for s in reversed(segments) if s["type"] == "station"), None)
-                    )
-                    fg_color = LABEL_FG if is_endpoint else "#E67E22"
-                    prefix   = "🚉" if is_endpoint else "🔄"
-                    tk.Label(
-                        detail_frame,
-                        text=f"{prefix} {time_str}{name}",
-                        font=FONT_BASE,
-                        fg=fg_color, bg=CARD_BG,
-                        anchor="w",
-                    ).pack(anchor="w", pady=1)
-
-                elif seg["type"] == "train":
-                    # 列車行: 「  ↓  のぞみ123号」
-                    tk.Label(
-                        detail_frame,
-                        text=f"    ↓  {seg['name']}",
-                        font=FONT_SMALL,
-                        fg=MUTED_FG, bg=CARD_BG,
-                        anchor="w",
-                    ).pack(anchor="w", pady=0)
+            self._render_segment_detail(detail_frame, segments)
         else:
-            # セグメント取得できなかった場合は1行空ける
             row += 1
 
         # ---- 予約ボタン ----
@@ -458,6 +437,86 @@ class TripAgentApp(tk.Tk):
             lambda url=booking_url: webbrowser.open(url),
             bg=BTN_TRAIN_BOOK, padx=10, pady=5,
         ).grid(row=row, column=1, columnspan=3, sticky="w", padx=4, pady=(4, 8))
+
+    def _render_segment_detail(self, frame: tk.Frame, segments: list) -> None:
+        """
+        経路セグメントを
+          🚃 07:03 大阪発（JR神戸線）
+          　↓
+          🚃 07:20 新大阪着
+          🚄 07:25 新大阪発（のぞみ316号）
+          　↓
+          🚄 09:08 品川着
+          …
+        の形式で frame 内にラベルを配置する。
+        """
+        stations = [s for s in segments if s["type"] == "station"]
+        trains   = [s for s in segments if s["type"] == "train"]
+
+        # 詳細モード: 列車1件以上 & 駅2件以上
+        if trains and len(stations) >= 2:
+            COLOR_SHIN    = "#0055A3"   # 新幹線：ブルー
+            COLOR_LOCAL   = LABEL_FG    # 在来線：標準
+            COLOR_TRANSFER = "#E67E22"  # 乗り換え駅：オレンジ
+            COLOR_ARROW   = MUTED_FG
+
+            for i, train in enumerate(trains):
+                is_shin = train.get("is_shinkansen") or _is_shinkansen_train(train["name"])
+                icon      = "🚄" if is_shin else "🚃"
+                clr_line  = COLOR_SHIN if is_shin else COLOR_LOCAL
+
+                # ---- 出発駅行 ----
+                dep_st = stations[i] if i < len(stations) else None
+                if dep_st:
+                    t     = dep_st.get("time", "")
+                    t_str = f"{t} " if t else ""
+                    dep_text = f"{icon} {t_str}{dep_st['name']}発（{train['name']}）"
+                    tk.Label(
+                        frame, text=dep_text,
+                        font=FONT_BASE, fg=clr_line, bg=CARD_BG, anchor="w",
+                    ).pack(anchor="w", pady=1)
+
+                # ---- 矢印 ----
+                tk.Label(
+                    frame, text="　　↓",
+                    font=FONT_SMALL, fg=COLOR_ARROW, bg=CARD_BG, anchor="w",
+                ).pack(anchor="w", pady=0)
+
+                # ---- 到着駅行 ----
+                arr_st = stations[i + 1] if i + 1 < len(stations) else None
+                if arr_st:
+                    t     = arr_st.get("time", "")
+                    t_str = f"{t} " if t else ""
+                    arr_text = f"{icon} {t_str}{arr_st['name']}着"
+                    # 乗り換え駅（続きあり）: オレンジ, 終点: 標準
+                    clr_arr = COLOR_TRANSFER if i + 1 < len(trains) else COLOR_LOCAL
+                    tk.Label(
+                        frame, text=arr_text,
+                        font=FONT_BASE, fg=clr_arr, bg=CARD_BG, anchor="w",
+                    ).pack(anchor="w", pady=1)
+
+        else:
+            # フォールバック: 旧形式（🚉 駅 / ↓ 列車）
+            for seg in segments:
+                if seg["type"] == "station":
+                    t    = seg.get("time", "")
+                    name = seg.get("name", "")
+                    time_str = f"{t}  " if t else ""
+                    last_station = next((s for s in reversed(segments) if s["type"] == "station"), None)
+                    is_endpoint = seg is segments[0] or seg is last_station
+                    fg_color = LABEL_FG if is_endpoint else "#E67E22"
+                    prefix   = "🚉" if is_endpoint else "🔄"
+                    tk.Label(
+                        frame,
+                        text=f"{prefix} {time_str}{name}",
+                        font=FONT_BASE, fg=fg_color, bg=CARD_BG, anchor="w",
+                    ).pack(anchor="w", pady=1)
+                elif seg["type"] == "train":
+                    tk.Label(
+                        frame,
+                        text=f"    ↓  {seg['name']}",
+                        font=FONT_SMALL, fg=MUTED_FG, bg=CARD_BG, anchor="w",
+                    ).pack(anchor="w", pady=0)
 
     def _render_hotel_search_links(self):
         """ホテル検索リンクエリアを描画する（楽天トラベル・じゃらんのボタン）。"""
